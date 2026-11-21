@@ -15,8 +15,8 @@ use crate::dataframe::{DataFrame, DataFrameOptions};
 use crate::dictionary::{Dictionary, xxh3};
 use crate::error::{Error, Result};
 use crate::heap::{Heap, MemHeap};
-use crate::index::{SegmentIndex, WordTable, build_index, compress_index, write_new_file};
-use crate::query::{self, Page, PageResult, Prepared, Query, RowSource};
+use crate::index::{SegmentIndex, WordTable, build_index, compress_index, write_file_atomically};
+use crate::query::{self, BufferSource, Page, PageResult, Prepared, Query, RowSource};
 use crate::schema::{Column, ColumnFlags, Schema};
 use crate::segment::{SegmentReader, WriteOptions, write_segment};
 use crate::tokenizer::TokenizerOptions;
@@ -57,7 +57,11 @@ pub struct StoreOptions {
     pub row_heap_block_bytes: usize,
     /// Target size of a heap block in bytes (default 1 MiB).
     pub heap_block_bytes: usize,
-    /// Store the search index files zstd-compressed (about 2.7 times smaller, but read into memory instead of mapped).
+    /// Write search index files when committing (default true). Without them, searches scan the rows; the indexes can
+    /// be built later with [`Store::build_indexes`].
+    pub indexing: bool,
+    /// Store the search index files zstd-compressed (default true; about 2.7 times smaller, but read into memory
+    /// instead of memory-mapped).
     pub compress_indexes: bool,
 }
 
@@ -72,7 +76,8 @@ impl Default for StoreOptions {
             block_rows: 4096,
             row_heap_block_bytes: 64 * 1024,
             heap_block_bytes: 1 << 20,
-            compress_indexes: false,
+            indexing: true,
+            compress_indexes: true,
         }
     }
 }
@@ -311,6 +316,8 @@ pub struct Frame {
     schema: Schema,
     words: SharedWords,
     writable: Arc<AtomicBool>,
+    /// The folder-wide write mutex of the store (see [`Store`]).
+    write_mutex: Arc<Mutex<()>>,
     state: RwLock<FrameState>,
 }
 
@@ -346,6 +353,7 @@ impl Frame {
         if !self.writable.load(Ordering::Acquire) {
             return Err(Error::ReadOnly);
         }
+        let _write = self.write_mutex.lock().expect("write mutex poisoned");
         let state = self.state.read().expect("frame lock poisoned");
         Ok(state.committed_rows + state.active.push_row(row)?)
     }
@@ -470,7 +478,7 @@ impl Frame {
                 return Ok(Some(Arc::clone(index)));
             }
         }
-        let bytes = state.active.with_inner(|inner| build_index(inner, &self.schema, words))?;
+        let bytes = build_index(&BufferSource(&state.active), &self.schema, words)?;
         let index = Arc::new(SegmentIndex::from_vec(bytes)?);
         *cache = Some((rows, Arc::clone(&index)));
         Ok(Some(index))
@@ -514,27 +522,6 @@ impl Iterator for RowIds<'_> {
                 }
             }
         }
-    }
-}
-
-/// The rows buffered in a dataframe, as a query source.
-struct BufferSource<'a>(&'a DataFrame<MemHeap>);
-
-impl RowSource for BufferSource<'_> {
-    fn row_count(&self) -> u64 {
-        self.0.len()
-    }
-
-    fn cell(&self, row: u64, column: usize) -> Result<(u64, bool)> {
-        self.0.source_cell(row, column)
-    }
-
-    fn with_entry(&self, cell: u64, f: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
-        self.0.source_entry(cell, f)
-    }
-
-    fn range(&self, column: usize, lo: u64, hi: u64) -> Result<Vec<u32>> {
-        self.0.source_range(column, lo, hi)
     }
 }
 
@@ -598,6 +585,8 @@ pub struct Store {
     options: StoreOptions,
     words: SharedWords,
     writable: Arc<AtomicBool>,
+    /// Serializes everything that writes: inserting rows, creating dataframes and committing. A folder has one writer at a time.
+    write_mutex: Arc<Mutex<()>>,
     committed: Mutex<Committed>,
     frames: RwLock<Vec<Arc<Frame>>>,
     /// The sorted word table, present once the store has been sealed.
@@ -634,6 +623,7 @@ impl Store {
             options,
             words,
             writable: Arc::new(AtomicBool::new(true)),
+            write_mutex: Arc::new(Mutex::new(())),
             committed: Mutex::new(committed),
             frames: RwLock::new(Vec::new()),
             word_table: RwLock::new(None),
@@ -668,7 +658,7 @@ impl Store {
             for entry in std::fs::read_dir(dir)?.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let stray = (name.ends_with(".seg") || (name.ends_with(".idx") && name != "words.idx")) && !known.contains(&name);
-                if name == "manifest.tmp" || stray {
+                if name == "manifest.tmp" || name.ends_with(".idx.tmp") || stray {
                     std::fs::remove_file(entry.path())?;
                 }
             }
@@ -681,6 +671,7 @@ impl Store {
         let limit = if writable { options.dictionary_bytes } else { usize::MAX };
         let words = WordStore::from_heap(heap, Dictionary::new(limit))?.into_shared();
         let flag = Arc::new(AtomicBool::new(writable));
+        let write_mutex = Arc::new(Mutex::new(()));
 
         let mut frames = Vec::new();
         for (id, meta) in manifest.frames.iter().enumerate() {
@@ -709,6 +700,7 @@ impl Store {
                 schema: meta.schema.clone(),
                 words: words.clone(),
                 writable: flag.clone(),
+                write_mutex: write_mutex.clone(),
                 state: RwLock::new(state),
             }));
         }
@@ -720,6 +712,7 @@ impl Store {
             options,
             words,
             writable: flag,
+            write_mutex: write_mutex.clone(),
             committed: Mutex::new(committed),
             frames: RwLock::new(frames),
             word_table: RwLock::new(word_table),
@@ -747,6 +740,7 @@ impl Store {
         if !self.is_writable() {
             return Err(Error::ReadOnly);
         }
+        let _write = self.write_mutex.lock().expect("write mutex poisoned");
         let mut frames = self.frames.write().expect("frame list lock poisoned");
         if frames.iter().any(|f| f.name == name) {
             return Err(Error::FrameExists);
@@ -764,6 +758,7 @@ impl Store {
             schema,
             words: self.words.clone(),
             writable: self.writable.clone(),
+            write_mutex: self.write_mutex.clone(),
             state: RwLock::new(state),
         });
         frames.push(frame.clone());
@@ -810,6 +805,7 @@ impl Store {
         if !self.is_writable() {
             return Err(Error::ReadOnly);
         }
+        let _write = self.write_mutex.lock().expect("write mutex poisoned");
         let mut committed = self.committed.lock().expect("commit lock poisoned");
         let frames = self.frames.read().expect("frame list lock poisoned");
         let mut guards: Vec<_> = frames.iter().map(|f| f.state.write().expect("frame lock poisoned")).collect();
@@ -838,14 +834,14 @@ impl Store {
                 continue;
             }
             let file = format!("f{}-{:06}.seg", frame.id, guard.next_segment);
-            let result = guard.active.with_inner(|inner| {
-                write_segment(&self.dir.join(&file), inner, write_options)?;
-                let words = self.words.read().expect("word store lock poisoned");
-                let mut index = build_index(inner, &frame.schema, &words)?;
-                if self.options.compress_indexes {
-                    index = compress_index(&index, self.options.zstd_level)?;
+            let result = guard.active.with_inner(|inner| write_segment(&self.dir.join(&file), inner, write_options)).and_then(|()| {
+                match self.options.indexing {
+                    true => {
+                        let words = self.words.read().expect("word store lock poisoned");
+                        write_index(&self.dir, &self.options, &frame.schema, &BufferSource(&guard.active), &words, &file)
+                    }
+                    false => Ok(()),
                 }
-                write_new_file(&self.dir.join(file.replace(".seg", ".idx")), &index)
             });
             match result {
                 Ok(()) => written.push((i, file, guard.active.len())),
@@ -897,8 +893,9 @@ impl Store {
             let guard = &mut guards[i];
             let reader = SegmentReader::open(&self.dir.join(&file), frames[i].schema.len())?;
             let start = guard.committed_rows;
-            let index = SegmentIndex::open(&self.dir.join(file.replace(".seg", ".idx")))?;
-            guard.segments.push(Segment { file, rows, start, reader, index: Some(index) });
+            let index_path = self.dir.join(file.replace(".seg", ".idx"));
+            let index = if index_path.exists() { Some(SegmentIndex::open(&index_path)?) } else { None };
+            guard.segments.push(Segment { file, rows, start, reader, index });
             guard.committed_rows += rows;
             guard.next_segment += 1;
             guard.active.clear();
@@ -913,6 +910,44 @@ impl Store {
             self.writable.store(false, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// Builds the search indexes that are missing in the store at `path`, from the stored segments and the heap: a segment
+    /// without an index file gets one (for columns flagged in its schema), and a sealed store without `words.idx` gets
+    /// one. Use it after committing with [`StoreOptions::indexing`] off, or on a store written before indexes existed. It
+    /// takes the writer lock, so the store must not be open for writing elsewhere; it can be run on a sealed store.
+    /// Stores that are already open do not notice new index files until they are reopened.
+    pub fn build_indexes(path: impl AsRef<Path>, options: StoreOptions) -> Result<IndexReport> {
+        let dir = path.as_ref();
+        let _lock = acquire_writer_lock(dir)?;
+        let manifest = read_manifest(dir)?;
+        let heap = read_heap(&dir.join("heap.bin"), manifest.heap_bytes, manifest.heap_words)?;
+        let words = WordStore::from_heap(heap, Dictionary::new(usize::MAX))?;
+        let mut report = IndexReport { segments_indexed: 0, word_table_written: false };
+        for frame in &manifest.frames {
+            let flags = |c: &Column| c.flags.index_words || c.flags.case_insensitive || c.flags.index_equality;
+            if !frame.schema.columns().iter().any(flags) {
+                continue;
+            }
+            for segment in &frame.segments {
+                if dir.join(segment.file.replace(".seg", ".idx")).exists() {
+                    continue;
+                }
+                let reader = SegmentReader::open(&dir.join(&segment.file), frame.schema.len())?;
+                write_index(dir, &options, &frame.schema, &reader, &words, &segment.file)?;
+                report.segments_indexed += 1;
+            }
+        }
+        let table = dir.join("words.idx");
+        if manifest.sealed && !table.exists() {
+            let tmp = dir.join("words.idx.tmp");
+            let _ = std::fs::remove_file(&tmp);
+            WordTable::write(&tmp, &words)?;
+            std::fs::rename(&tmp, &table)?;
+            report.word_table_written = true;
+        }
+        sync_dir(dir);
+        Ok(report)
     }
 
     /// The ordinal of a word in the shared heap.
@@ -969,6 +1004,31 @@ impl Store {
         }
         Ok(total)
     }
+}
+
+/// Builds the index of a segment from `src` and writes it next to the segment file `segment_file` (`.seg` -> `.idx`).
+fn write_index(
+    dir: &Path,
+    options: &StoreOptions,
+    schema: &Schema,
+    src: &dyn RowSource,
+    words: &WordStore,
+    segment_file: &str,
+) -> Result<()> {
+    let mut bytes = build_index(src, schema, words)?;
+    if options.compress_indexes {
+        bytes = compress_index(&bytes, options.zstd_level)?;
+    }
+    write_file_atomically(&dir.join(segment_file.replace(".seg", ".idx")), &bytes)
+}
+
+/// What [`Store::build_indexes`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexReport {
+    /// Segments that got a new index file.
+    pub segments_indexed: usize,
+    /// Whether `words.idx` was written.
+    pub word_table_written: bool,
 }
 
 fn new_active(schema: &Schema, words: &SharedWords, options: &StoreOptions) -> DataFrame<MemHeap> {
@@ -1523,25 +1583,30 @@ mod tests {
 
     #[test]
     fn verify_detects_a_damaged_index() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let store = Store::create(dir.path(), options()).unwrap();
-            let frame = store.create_frame("f", search_schema(true)).unwrap();
-            for i in 0..30 {
-                push_search_row(&frame, i);
+        for compress in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = StoreOptions { compress_indexes: compress, ..options() };
+            {
+                let store = Store::create(dir.path(), opts.clone()).unwrap();
+                let frame = store.create_frame("f", search_schema(true)).unwrap();
+                for i in 0..30 {
+                    push_search_row(&frame, i);
+                }
+                store.seal().unwrap();
             }
-            store.seal().unwrap();
+            let path = dir.path().join("f0-000000.idx");
+            let good = std::fs::read(&path).unwrap();
+            Store::open_read_only(dir.path(), opts.clone()).unwrap().verify().unwrap();
+            let mut bad = good.clone();
+            let at = bad.len() - 30;
+            bad[at] ^= 0x01;
+            std::fs::write(&path, &bad).unwrap();
+            // a plain (memory-mapped) file is only checked by verify(); a compressed one is decoded when the store opens
+            let damaged = Store::open_read_only(dir.path(), opts.clone()).and_then(|store| store.verify());
+            assert!(damaged.is_err(), "compress = {compress}");
+            std::fs::write(&path, &good).unwrap();
+            Store::open_read_only(dir.path(), opts).unwrap().verify().unwrap();
         }
-        let path = dir.path().join("f0-000000.idx");
-        let good = std::fs::read(&path).unwrap();
-        Store::open_read_only(dir.path(), options()).unwrap().verify().unwrap();
-        let mut bad = good.clone();
-        let at = bad.len() - 30;
-        bad[at] ^= 0x01;
-        std::fs::write(&path, &bad).unwrap();
-        assert!(Store::open_read_only(dir.path(), options()).unwrap().verify().is_err());
-        std::fs::write(&path, &good).unwrap();
-        Store::open_read_only(dir.path(), options()).unwrap().verify().unwrap();
     }
 
     #[test]
@@ -1557,6 +1622,82 @@ mod tests {
         let store = Store::open(dir.path(), options()).unwrap();
         assert!(!dir.path().join("f0-000077.idx").exists() && dir.path().join("f0-000000.idx").exists());
         assert_eq!(store.frame("f").unwrap().count(&Query::new().word(2, "request")).unwrap(), 1);
+    }
+
+    #[test]
+    fn indexing_can_be_off_and_built_later_from_the_stored_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let off = StoreOptions { indexing: false, ..options() };
+        {
+            let store = Store::create(dir.path(), off.clone()).unwrap();
+            let frame = store.create_frame("indexed", search_schema(true)).unwrap();
+            for i in 0..70 {
+                push_search_row(&frame, i);
+            }
+            store.commit().unwrap();
+            for i in 70..100 {
+                push_search_row(&frame, i);
+            }
+            store.seal().unwrap();
+            check_search(&frame, "no index files yet"); // scans, still correct
+        }
+        let files =
+            |ext: &str| std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().ends_with(ext)).count();
+        assert_eq!((files(".seg"), files(".idx")), (2, 1)); // only words.idx, which sealing always writes
+        std::fs::remove_file(dir.path().join("words.idx")).unwrap();
+
+        let report = Store::build_indexes(dir.path(), options()).unwrap();
+        assert_eq!(report, IndexReport { segments_indexed: 2, word_table_written: true });
+        assert_eq!((files(".idx"), files(".tmp")), (3, 0));
+        assert_eq!(Store::build_indexes(dir.path(), options()).unwrap(), IndexReport { segments_indexed: 0, word_table_written: false });
+
+        let store = Store::open_read_only(dir.path(), options()).unwrap();
+        check_search(&store.frame("indexed").unwrap(), "indexes built later");
+        store.verify().unwrap();
+        assert_eq!(store.words_with_prefix("us", 2), ["user0", "user1"]);
+    }
+
+    #[test]
+    fn building_indexes_needs_the_writer_lock_and_leaves_no_partial_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), StoreOptions { indexing: false, ..options() }).unwrap();
+        let frame = store.create_frame("indexed", search_schema(true)).unwrap();
+        push_search_row(&frame, 1);
+        store.commit().unwrap();
+        assert!(matches!(Store::build_indexes(dir.path(), options()), Err(Error::Locked)));
+        drop(store);
+        std::fs::write(dir.path().join("f0-000000.idx.tmp"), b"half written").unwrap();
+        Store::open(dir.path(), options()).unwrap(); // a writable open removes the leftover
+        assert!(!dir.path().join("f0-000000.idx.tmp").exists());
+        assert_eq!(Store::build_indexes(dir.path(), options()).unwrap().segments_indexed, 1);
+    }
+
+    #[test]
+    fn writes_to_different_dataframes_are_serialized_with_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), StoreOptions { segment_rows: 25, ..options() }).unwrap();
+        let (a, b) = (store.create_frame("a", search_schema(true)).unwrap(), store.create_frame("b", search_schema(true)).unwrap());
+        std::thread::scope(|scope| {
+            for frame in [&a, &b] {
+                for thread in 0..2u64 {
+                    let store = &store;
+                    scope.spawn(move || {
+                        for i in 0..60u64 {
+                            push_search_row(frame, thread * 100 + i);
+                            if i % 5 == 0 {
+                                store.commit_if_full().unwrap();
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        store.commit().unwrap();
+        assert_eq!((a.len(), b.len()), (120, 120));
+        drop(store);
+        let store = Store::open(dir.path(), options()).unwrap();
+        assert_eq!(store.frame("a").unwrap().count(&Query::new().word(2, "request")).unwrap(), 120);
+        store.verify().unwrap();
     }
 
     #[test]

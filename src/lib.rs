@@ -32,7 +32,7 @@ pub use heap::{Heap, MemHeap};
 pub use query::{Filter, OrderBy, Page, PageResult, Query};
 pub use schema::{Column, ColumnFlags, Schema};
 pub use splitter::{DefaultSplitter, JsonEscapeSplitter, Splitter};
-pub use store::{Frame, FrameRows, RowIds, Store, StoreOptions};
+pub use store::{Frame, FrameRows, IndexReport, RowIds, Store, StoreOptions};
 pub use tokenizer::{StreamStats, Symbol, Tokenizer, TokenizerOptions, analyze, symbols};
 pub use types::{ColumnType, OwnedValue, Value};
 pub use words::{Checkpoint, SharedWords, WordStore};

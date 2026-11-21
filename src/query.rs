@@ -6,8 +6,10 @@
 //! the column's splitter, so a phrase is split into words the same way the text was when it was stored.
 
 use crate::cell;
+use crate::dataframe::DataFrame;
 use crate::dictionary::xxh3;
 use crate::error::{Error, Result};
+use crate::heap::MemHeap;
 use crate::index::{KIND_EQUAL, KIND_FOLD, KIND_WORD, SegmentIndex, fold_hash};
 use crate::schema::Schema;
 use crate::splitter::{DefaultSplitter, JsonEscapeSplitter, Splitter, split_words};
@@ -133,6 +135,27 @@ pub(crate) trait RowSource {
     fn with_entry(&self, cell: u64, f: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>;
     /// Rows whose non-null cell in `column` lies in `lo..=hi`.
     fn range(&self, column: usize, lo: u64, hi: u64) -> Result<Vec<u32>>;
+}
+
+/// The rows buffered in a dataframe, as a query (and index) source.
+pub(crate) struct BufferSource<'a>(pub(crate) &'a DataFrame<MemHeap>);
+
+impl RowSource for BufferSource<'_> {
+    fn row_count(&self) -> u64 {
+        self.0.len()
+    }
+
+    fn cell(&self, row: u64, column: usize) -> Result<(u64, bool)> {
+        self.0.source_cell(row, column)
+    }
+
+    fn with_entry(&self, cell: u64, f: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.0.source_entry(cell, f)
+    }
+
+    fn range(&self, column: usize, lo: u64, hi: u64) -> Result<Vec<u32>> {
+        self.0.source_range(column, lo, hi)
+    }
 }
 
 /// A query symbol of a phrase.

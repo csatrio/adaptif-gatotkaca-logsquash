@@ -21,11 +21,11 @@
 //! 2.7 times smaller; such a file is decompressed into memory when it is opened instead of being mapped.
 
 use crate::codec::{Reader, Writer};
-use crate::dataframe::Inner;
 use crate::dictionary::xxh3;
 use crate::error::{Error, Result};
 use crate::filebytes::FileBytes;
 use crate::heap::Heap;
+use crate::query::RowSource;
 use crate::schema::Schema;
 use crate::tokenizer::{Symbol, decode_with, symbols};
 use crate::types::ColumnType;
@@ -47,6 +47,17 @@ const DIR_ENTRY: usize = 8 + 8 + 4;
 /// Hash of the case-folded word (full Unicode case folding).
 pub(crate) fn fold_hash(word: &str) -> u64 {
     xxh3(caseless::default_case_fold_str(word).as_bytes(), 0)
+}
+
+/// Writes `bytes` to `<path>.tmp`, syncs it and renames it to `path`, so a crash never leaves a half-written `path`.
+pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    write_new_file(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Writes `bytes` to a new file and syncs it.
@@ -81,12 +92,12 @@ pub(crate) fn compress_index(raw: &[u8], level: i32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Builds the index file of a segment from the buffered rows it is written from.
-pub(crate) fn build_index<H: Heap>(inner: &Inner, schema: &Schema, words: &WordStore<H>) -> Result<Vec<u8>> {
+/// Builds the index file of a segment from its rows, wherever they are (the buffer they are written from, or a written segment).
+pub(crate) fn build_index<H: Heap>(src: &dyn RowSource, schema: &Schema, words: &WordStore<H>) -> Result<Vec<u8>> {
     let mut tables: Vec<(u32, u8, BTreeMap<u64, Vec<u32>>)> = Vec::new();
     let mut fold_of: HashMap<u32, u64> = HashMap::new();
     for (c, column) in schema.columns().iter().enumerate() {
-        let (flags, data) = (column.flags, &inner.columns[c]);
+        let flags = column.flags;
         let is_string = column.ty == ColumnType::String;
         let (want_words, want_fold, want_equal) =
             (flags.index_words && is_string, flags.case_insensitive && is_string, flags.index_equality);
@@ -95,41 +106,42 @@ pub(crate) fn build_index<H: Heap>(inner: &Inner, schema: &Schema, words: &WordS
         }
         let (mut word_lists, mut fold_lists, mut equal_lists) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::<u64, Vec<u32>>::new());
         let mut entries: HashMap<u64, EntryInfo> = HashMap::new();
-        for row in 0..inner.rows as usize {
-            if data.nulls.get(row) {
+        for row in 0..src.row_count() as usize {
+            let (cell, null) = src.cell(row as u64, c)?;
+            if null {
                 continue;
             }
-            let cell = data.cells[row];
             if !is_string {
                 equal_lists.entry(cell).or_default().push(row as u32);
                 continue;
             }
-            let offset = cell - 1;
-            if let std::collections::hash_map::Entry::Vacant(slot) = entries.entry(offset) {
-                let tail = &inner.row_heap[offset as usize..];
+            if let std::collections::hash_map::Entry::Vacant(slot) = entries.entry(cell) {
                 let mut info = EntryInfo::default();
-                if want_words || want_fold {
-                    info.ordinals =
-                        symbols(tail)?.into_iter().filter_map(|s| if let Symbol::Word(o) = s { Some(o) } else { None }).collect();
-                    info.ordinals.sort_unstable();
-                    info.ordinals.dedup();
-                }
-                if want_fold {
-                    for &ordinal in &info.ordinals {
-                        let word = words.get(ordinal).ok_or(Error::Corrupt("unknown word ordinal"))?;
-                        info.folds.push(*fold_of.entry(ordinal).or_insert_with(|| fold_hash(word)));
+                src.with_entry(cell, &mut |tail| {
+                    if want_words || want_fold {
+                        info.ordinals =
+                            symbols(tail)?.into_iter().filter_map(|s| if let Symbol::Word(o) = s { Some(o) } else { None }).collect();
+                        info.ordinals.sort_unstable();
+                        info.ordinals.dedup();
                     }
-                    info.folds.sort_unstable();
-                    info.folds.dedup();
-                }
-                if want_equal {
-                    let mut text = Vec::new();
-                    decode_with(words, tail, &mut text)?;
-                    info.text_hash = xxh3(&text, 0);
-                }
+                    if want_fold {
+                        for &ordinal in &info.ordinals {
+                            let word = words.get(ordinal).ok_or(Error::Corrupt("unknown word ordinal"))?;
+                            info.folds.push(*fold_of.entry(ordinal).or_insert_with(|| fold_hash(word)));
+                        }
+                        info.folds.sort_unstable();
+                        info.folds.dedup();
+                    }
+                    if want_equal {
+                        let mut text = Vec::new();
+                        decode_with(words, tail, &mut text)?;
+                        info.text_hash = xxh3(&text, 0);
+                    }
+                    Ok(())
+                })?;
                 slot.insert(info);
             }
-            let info = &entries[&offset];
+            let info = &entries[&cell];
             if want_words {
                 info.ordinals.iter().for_each(|&o| word_lists.entry(u64::from(o)).or_insert_with(Vec::new).push(row as u32));
             }
@@ -373,6 +385,7 @@ mod tests {
     use crate::dataframe::DataFrame;
     use crate::dictionary::Dictionary;
     use crate::heap::MemHeap;
+    use crate::query::BufferSource;
     use crate::schema::Column;
     use crate::types::Value;
     use crate::words::SharedWords;
@@ -402,7 +415,7 @@ mod tests {
 
     fn built(frame: &DataFrame, shared: &SharedWords) -> SegmentIndex {
         let words = shared.read().unwrap();
-        SegmentIndex::from_vec(frame.with_inner(|inner| build_index(inner, frame.schema(), &words)).unwrap()).unwrap()
+        SegmentIndex::from_vec(build_index(&BufferSource(frame), frame.schema(), &words).unwrap()).unwrap()
     }
 
     #[test]
@@ -433,7 +446,7 @@ mod tests {
         let shared = shared();
         let frame = frame(&shared);
         let words = shared.read().unwrap();
-        let bytes = frame.with_inner(|inner| build_index(inner, frame.schema(), &words)).unwrap();
+        let bytes = build_index(&BufferSource(&frame), frame.schema(), &words).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.idx");
         write_new_file(&path, &bytes).unwrap();
@@ -462,7 +475,7 @@ mod tests {
         let shared = shared();
         let frame = frame(&shared);
         let words = shared.read().unwrap();
-        let raw = frame.with_inner(|inner| build_index(inner, frame.schema(), &words)).unwrap();
+        let raw = build_index(&BufferSource(&frame), frame.schema(), &words).unwrap();
         let packed = compress_index(&raw, 3).unwrap();
         assert!(packed.len() < raw.len());
         let dir = tempfile::tempdir().unwrap();
