@@ -91,7 +91,7 @@ Because the Dictionary stores only hashes, a hit is verified against the heap by
 ### 5.4 Locking
 The Heap and Dictionary live together behind one `RwLock` inside a `Store` (one folder), shared as `Arc<Store>`.
 - Lookups and hydration take the read lock; inserting a new word takes the write lock after a read-locked miss, re-checking under the write lock.
-- Each dataframe has its own internal lock (several threads may `push_row(&self)`); lock order is dataframe lock, then store lock.
+- **One writer at a time per folder.** A single `Store` write mutex serializes everything that writes: `push_row` on any dataframe, `create_frame` and `commit`. So a commit never overlaps an insert, and a folder is written by one thread at a time (and one process at a time, through the writer file lock). Reads (`row`, `search`, ...) do not take the mutex and run in parallel with each other and with a writer. Lock order is: write mutex, then dataframe lock, then the word store lock.
 - Insert throughput is not a goal, so there is no sharding or per-row batching.
 
 ## 6. Dataframe
@@ -126,7 +126,17 @@ column_count | per column: name, type code (u8), flags, text format (null-termin
 A value that does not fit the column type is an error (`ValueOutOfRange`), never a silent truncation. `TimestampTz` covers about +-4,450 years, keeps whole-minute offsets, and sorts by instant then offset.
 
 #### 6.2.2 Date and time text parsing
-The library parses and formats date/time text with `chrono`: ISO-8601/RFC-3339, RFC-2822/HTTP date, Apache/nginx Common Log Format time, and user `strftime` patterns. Each column names its format explicitly (no auto-detection). Text with no offset is read as UTC (`TimestampTz` stores offset 0). Parse failures, out-of-range dates, offsets with seconds and leap seconds are errors. Formatting precision follows the column unit (0/3/6/9 digits).
+The `datetime` module parses date/time text into the values of date/time columns and formats them back, using `chrono`. Each column names its text format in the schema (`Column::text_format`, validated when the schema is built):
+- `""` or `builtin:iso8601`: ISO-8601 / RFC-3339 (`2026-11-21T10:15:30.123+07:00`, `2026-11-21T10:15:30Z`, `2026-11-21 10:15:30`, `2026-11-21`; a date alone is midnight UTC; `Date` columns take `YYYY-MM-DD`, `TimeOfDay` columns `HH:MM[:SS[.fraction]]`)
+- `builtin:rfc2822`: RFC-2822 / HTTP date (`Sat, 21 Nov 2026 10:15:30 +0700`, `... GMT`); timestamps only
+- `builtin:clf`: Common Log Format time (`21/Nov/2026:10:15:30 +0700`); timestamps only
+- `strftime:<pattern>`: a chrono/strftime pattern (use `%z` or `%:z` for an offset); a date-only pattern gives midnight
+
+**Rules.** Text without a UTC offset is read as UTC (a `TimestampTz` then gets offset 0); an offset is folded into the UTC instant for the plain timestamp types and kept (in whole minutes) by `TimestampTz`. These are errors (`Error::DateParse`, naming the column): text that does not match the format, a leap second (`23:59:60`), a UTC offset with seconds, a value outside the column's range (nanoseconds cover about 1677-2262), and **text finer than the column's unit** (milliseconds in a `TimestampSec` column, microseconds in a `TimestampMs` or `TimestampTz` column): parsing never rounds or truncates, so choose the unit that matches the data. The library never stores null on a parse failure.
+
+**Formatting** writes as many fractional digits as the unit has (seconds none, milliseconds 3, microseconds 6, nanoseconds 9) and `Z` for UTC (`+07:00` style for `TimestampTz`). `rfc2822` and `clf` have no fractions, so they drop them for finer units.
+
+**Where it is used.** Inserting `Value::Str(text)` into a date/time column parses it with the column's format (a bad value leaves the dataframe unchanged); `Column::format_value(&OwnedValue)` gives the text of a value read back; and `Equals`/`Range` filters on a date/time column accept text bounds, parsed the same way. Numeric values (`Value::TimestampMs(..)`, ...) are accepted as before.
 
 ### 6.3 Segments and blocks
 A dataframe is stored as one or more **segment files** (Q78). Each **commit** writes the rows buffered since the previous commit as one new, immutable segment; `commit_if_full()` commits when a dataframe has buffered `segment_rows` (default 100,000) rows, so segments are normally about that size, but may be smaller (a commit after a few rows) or larger (a caller that pushes more between commits). The manifest lists every segment with its row count, and **global row numbers** are resolved by binary search over the cumulative counts (this replaces the fixed `row / segment_size` rule of Q90, which does not hold for variable-size segments). A segment is **column-major**: rows are grouped into blocks of 4,096; for each column in a block the file stores a null bitmap flag, the **minimum and maximum** value, and a zstd-compressed block holding the null bitmap and the cell bytes transposed into 8 byte planes (which compresses integers and offsets well). A footer index gives each block's file position, size and checksum, so a reader opens a segment by reading only the footer and loads and decompresses only the blocks it touches (with a small cache). Many tiny segments (frequent commits) cost some overhead; compaction at seal time is future work.
@@ -152,7 +162,8 @@ The viewer needs: word/phrase search, equality filters, a time range, sorting an
 **Per-column index flags** (in the schema): `index_words` (word index, string columns), `case_insensitive` (an additional index of case-folded words, string columns) and `index_equality` (any column except `Blob`). Only flagged columns are indexed, which keeps the file size under control.
 
 **Index file** (`LSQIDX01`): a table of term indexes, one per (column, kind). Each term index is a sorted directory of `(key, postings offset, count)` entries (20 bytes each) and delta-varint posting lists of ascending row numbers. Keys: the word ordinal (words), the xxh3 hash of the case-folded word (case-insensitive), and the cell value, or the xxh3 hash of the text for strings (equality). A whole-file xxh3 checksum is checked by `Store::verify()`, not on every open. Single-character words are never indexed (they would match nearly every row) and are checked by scanning.
-- **Compression option:** with `StoreOptions::compress_indexes` the index file is stored zstd-compressed (`LSQIDXZ1`, about 2.7 times smaller) and decompressed into memory when opened, instead of being mapped. See 13 for the measured size trade-off.
+- **Compression:** index files are stored zstd-compressed by default (`StoreOptions::compress_indexes`, `LSQIDXZ1`, about 2.7 times smaller) and decompressed into memory when opened; turn it off to memory-map plain index files (`LSQIDX01`) instead. Compressed files are checked when opened; plain files by `Store::verify()`. See 13 for the sizes.
+- **Indexing is optional:** `StoreOptions::indexing = false` writes no index files at commit (searches then scan, with identical results). `Store::build_indexes(path, options)` builds every missing segment index, and a sealed store's `words.idx`, later from the stored segments and the heap (it takes the writer lock and may be run on a sealed store; a store that is already open sees the new files after reopening). Index building reads rows through the same row-source interface as queries, so it works on rows in memory and on written segments.
 - **Word table:** a sealed folder also gets `words.idx`: the ordinals sorted by the words' bytes (4 bytes per word, memory-mapped). It serves `Store::lookup_word` and prefix suggestions (`Store::words_with_prefix`) with binary search; before sealing, suggestions scan the heap.
 - Rows are matched against the symbol streams, so the index of a segment is built once, when the segment is written, from the rows in memory (no re-decoding of the segment).
 
@@ -237,7 +248,7 @@ A store is a **folder** covering one day or other time period. All its dataframe
 | 46 | Integrity? | Checksum (xxh3-64) per block, verified on load. |
 | 47 | Newer file version? | Reject. |
 | 48 | Dictionary on disk? | Superseded by Q80/Q84: the dictionary persists across sessions but is rebuilt from the heap, not stored as pairs. |
-| 49 | Writers per dataframe? | Several threads allowed; each dataframe has an internal lock (`push_row(&self)`). |
+| 49 | Writers? | One writer per folder: a single store-wide mutex serializes `push_row`, `create_frame` and `commit` (supersedes the earlier per-dataframe locking). |
 | 50 | Store write-lock contention? | Accepted for v1; no per-row batching; measure. |
 | 51 | Header format names? | Prefix scheme: `builtin:<name>` and `strftime:<pattern>`. |
 | 52 | Text output precision? | Follows the column unit (0/3/6/9 digits). |
@@ -284,12 +295,14 @@ A store is a **folder** covering one day or other time period. All its dataframe
 | 93 | mmap? | `memmap2` feature on by default but used only for index files; blocks use plain reads. |
 | 94 | Review points? | Stop after milestone 1 (with compression numbers) and after milestone 3. |
 | 95 | Search semantics? | Words are heap words or single characters from the symbol streams; inline runs are not words (use equality); index and scan paths give identical results. |
-| 96 | Index compression? | Optional zstd-compressed index files (`compress_indexes`, default off pending a decision); compressed files are read into memory, plain files are memory-mapped. |
+| 96 | Index compression? | Compressed index files by default (`compress_indexes`); plain mmap-able files remain an option. |
+| 97 | Indexing optional? | Yes: `StoreOptions::indexing`; `Store::build_indexes` builds missing indexes later from the stored segments and heap. |
+| 98 | Date/time parsing details? | ISO-8601/RFC-3339, RFC-2822, CLF and strftime; UTC when no offset; errors for finer-than-unit precision, leap seconds, offsets with seconds and out-of-range values; text accepted on insert and in filters. |
 | (note) | Folder = period | A folder covers a day or other period and is shared by all its dataframes; on rotation the dictionary is dropped, the heap and indexes stay. |
 
 ## 9. Open Questions
 - Entropy thresholds (4.5 base64, 4.0 opaque) are guesses; calibrate on the corpus in milestone 1.
-- **Index size versus the 30% target (decision needed):** with every index flag set, plain (memory-mapped) index files make the sample 35.9% of raw; zstd-compressed index files make it 31.1% (whole corpus: 28.7%). `compress_indexes` is off by default because Q93 wanted memory-mapped index reads. Whether to turn it on by default, and/or to index fewer columns (the `data` word index alone is 3.4% of raw), is the user's call; see 13.
+- Index files are about 3% of raw when compressed, 7.8% when plain; the whole corpus with every index flag set is 28.2% of raw (see 13). Consider flagging fewer columns only if a future corpus misses the 30% target.
 - Thresholds to measure: base64 run length (64), opaque run length (24), segment size (100,000 rows), column block size (4,096 rows), row-heap block size (64 KiB), zstd level, per-entry dictionary cost estimate (32 bytes).
 - MSRV: `caseless` does not declare a minimum Rust version; `rust-version = "1.85"` is not yet verified against it.
 
@@ -377,4 +390,14 @@ These findings drove the symbol encoding (4.3), inline base64/opaque runs (4.2),
 | whole corpus (831,523 rows, 775.5 MB), compressed | 198.39 MB = 25.6% | 23.50 MB = 3.0% | 222.50 MB = 28.7% |
 
   On the sample the plain index cost splits as: words on `text` 2.0%, words on `data` 3.4% more, the case-insensitive index 1.8% more, equality on six columns 0.5%. (`words.idx` adds 0.17 MB on the sample and 0.61 MB on the corpus, included above.) Query times on the whole corpus, indexed versus a scan of the unindexed twin: word `error` in `text` 0.1 ms vs 733 ms; case-insensitive 0.1 ms vs 1.6 s; word in `data` matching 654,821 rows 3.3 ms vs 1.1 s; `type = assistant` 0.3 ms vs 91 ms; phrase `let me` 75 ms vs 730 ms; type + subtype + word `error` 0.6 ms vs 684 ms; a page of 50 sorted rows out of 77,406 matches 14 ms; prefix suggestions 0.6 ms. A single-character word (`:`) is scanned either way (0.7 s). Indexed and unindexed searches agree on every query.
-- Next: date/time parsing (milestone 5), then benchmarks and tuning (6).
+- **Changes after milestone 4:** compressed index files are the default; `StoreOptions::indexing` can turn index files off and `Store::build_indexes` builds them later from the stored data; all writes in a folder go through one mutex (5.4).
+- **Milestone 5 done:** the `datetime` module (formats, strict parsing, formatting), validation of `text_format` in schemas, text values accepted for date/time columns on insert and in `Equals`/`Range` filters, `Column::format_value`. 96 tests pass and clippy is clean. Tests cover every format, all five timestamp units, `Date` and `TimeOfDay`, offsets, the error rules, property tests for format-then-parse round trips, atomic failure of a bad row, and queries and sorting by time after a reopen.
+- **Measured on the corpus** with `ts`, `created_at`, `started_at` and `ended_at` stored as `TimestampMs` (the example harnesses insert the ISO text and check that formatting gives back exactly the original text; 0 mismatches):
+
+| Input | Without indexes | With every index (compressed) |
+|---|---|---|
+| sample (90.5 MB) | 24.95 MB = 27.6% | not run with compression |
+| whole corpus (775.5 MB) | 194.56 MB = 25.1% (was 25.6% with timestamps as text) | 218.66 MB = 28.2% |
+
+  A time-range query on the whole corpus (`ts` between two ISO strings) returns the same 1,247 rows with and without indexes, in about 0.1 ms either way (the range filter uses the per-block minimum and maximum).
+- Next: benchmarks and tuning (milestone 6).

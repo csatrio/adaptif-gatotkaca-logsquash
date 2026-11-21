@@ -55,6 +55,9 @@ fn infer_columns(files: &[PathBuf]) -> Fallible<Vec<Column>> {
     })?;
     for (column, ty) in columns.iter_mut().zip(seen) {
         column.ty = ty.unwrap_or(ColumnType::String);
+        if column.ty == ColumnType::String && ["ts", "created_at", "started_at", "ended_at"].contains(&column.name.as_str()) {
+            column.ty = ColumnType::TimestampMs; // ISO-8601 text, parsed by the library
+        }
     }
     Ok(columns)
 }
@@ -177,6 +180,10 @@ fn main() -> Fallible<()> {
         (
             "tool_result + word 'error'",
             Query::new().equals(ty, Value::Str("user")).equals(subtype, Value::Str("tool_result")).word(data, "error"),
+        ),
+        (
+            "ts 00:25..00:30 on 2026-11-18",
+            Query::new().range(col("ts"), Some(Value::Str("2026-11-18T00:25:00Z")), Some(Value::Str("2026-11-18T00:30:00Z"))),
         ),
         (
             "kind run",

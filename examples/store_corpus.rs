@@ -10,6 +10,9 @@ use serde_json::{Map, Value as Json};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// Columns of the transcripts that hold ISO-8601 timestamps with milliseconds.
+const TIMESTAMPS: [&str; 4] = ["ts", "created_at", "started_at", "ended_at"];
+
 type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn for_each_line(files: &[PathBuf], mut f: impl FnMut(Map<String, Json>) -> Fallible<()>) -> Fallible<()> {
@@ -55,6 +58,9 @@ fn infer_schema(files: &[PathBuf]) -> Fallible<Schema> {
     })?;
     for (column, ty) in columns.iter_mut().zip(seen) {
         column.ty = ty.unwrap_or(ColumnType::String);
+        if column.ty == ColumnType::String && TIMESTAMPS.contains(&column.name.as_str()) {
+            column.ty = ColumnType::TimestampMs; // ISO-8601 text such as 2026-11-18T00:25:28.366Z, parsed by the library
+        }
     }
     Ok(Schema::new(columns)?)
 }
@@ -165,7 +171,12 @@ fn main() -> Fallible<()> {
     for_each_line(&files, |object| {
         let row = frame.row(n)?;
         for (column, got) in schema.columns().iter().zip(&row) {
-            if *got != expected(column.ty, object.get(&column.name)) {
+            let same = if column.ty.is_temporal() {
+                column.format_value(got)? == object.get(&column.name).and_then(text_of)
+            } else {
+                *got == expected(column.ty, object.get(&column.name))
+            };
+            if !same {
                 mismatches += 1;
                 if mismatches <= 5 {
                     println!("MISMATCH row {n} column {}: {got:?}", column.name);

@@ -218,6 +218,22 @@ fn string_column(schema: &Schema, column: usize) -> Result<()> {
     Ok(())
 }
 
+/// The cell value of a filter value; text is parsed with the column's text format for date/time columns.
+fn encode_bound(col: &crate::schema::Column, ty: ColumnType, value: &OwnedValue) -> Result<u64> {
+    let parsed;
+    let value = match value {
+        OwnedValue::Str(text) if ty.is_temporal() => {
+            parsed = crate::datetime::parse(ty, &col.text_format, text).map_err(|e| match e {
+                Error::DateParse { reason, .. } => Error::DateParse { column: col.name.clone(), reason },
+                other => other,
+            })?;
+            &parsed
+        }
+        other => other,
+    };
+    cell::encode(ty, &col.name, &value.as_value())?.ok_or_else(|| Error::TypeMismatch { column: col.name.clone() })
+}
+
 /// Resolves the words and values of `query`. Fails on bad columns, types and bounds.
 pub(crate) fn prepare(query: &Query, schema: &Schema, words: &WordStore) -> Result<Vec<Prepared>> {
     let mut out = Vec::new();
@@ -276,9 +292,7 @@ pub(crate) fn prepare(query: &Query, schema: &Schema, words: &WordStore) -> Resu
                     (_, OwnedValue::Null) => Target::Null,
                     (ColumnType::String, OwnedValue::Str(text)) => Target::Text { hash: xxh3(text.as_bytes(), 0), text: text.clone() },
                     (ColumnType::String | ColumnType::Blob, _) => return Err(Error::TypeMismatch { column: col.name.clone() }),
-                    (ty, v) => Target::Cell(
-                        cell::encode(ty, &col.name, &v.as_value())?.ok_or_else(|| Error::TypeMismatch { column: col.name.clone() })?,
-                    ),
+                    (ty, v) => Target::Cell(encode_bound(col, ty, v)?),
                 };
                 Prepared::Equals { column: *column, target }
             }
@@ -289,9 +303,7 @@ pub(crate) fn prepare(query: &Query, schema: &Schema, words: &WordStore) -> Resu
                 }
                 let bound = |v: &Option<OwnedValue>, default: u64| match v {
                     None => Ok(default),
-                    Some(v) => {
-                        cell::encode(col.ty, &col.name, &v.as_value())?.ok_or_else(|| Error::TypeMismatch { column: col.name.clone() })
-                    }
+                    Some(v) => encode_bound(col, col.ty, v),
                 };
                 Prepared::Range { column: *column, lo: bound(min, 0)?, hi: bound(max, u64::MAX)? }
             }

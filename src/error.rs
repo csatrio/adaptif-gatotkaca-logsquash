@@ -48,6 +48,13 @@ pub enum Error {
     UnsupportedVersion,
     /// A query is not valid (for example an empty word).
     InvalidQuery(&'static str),
+    /// Text could not be parsed as a date or time, or does not fit the column.
+    DateParse {
+        /// The column (empty when not known).
+        column: String,
+        /// Why.
+        reason: String,
+    },
 }
 
 /// Result alias using [`Error`].
@@ -72,6 +79,8 @@ impl fmt::Display for Error {
             Error::FrameExists => write!(f, "a dataframe with that name exists already"),
             Error::UnsupportedVersion => write!(f, "unsupported format version"),
             Error::InvalidQuery(what) => write!(f, "invalid query: {what}"),
+            Error::DateParse { column, reason } if column.is_empty() => write!(f, "date/time text: {reason}"),
+            Error::DateParse { column, reason } => write!(f, "date/time text for column {column:?}: {reason}"),
         }
     }
 }

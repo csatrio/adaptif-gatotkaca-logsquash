@@ -59,6 +59,17 @@ impl Column {
         self
     }
 
+    /// The text of a value read from this (date/time) column, in the column's text format; `None` for null.
+    pub fn format_value(&self, value: &crate::types::OwnedValue) -> Result<Option<String>> {
+        if matches!(value, crate::types::OwnedValue::Null) {
+            return Ok(None);
+        }
+        crate::datetime::format(self.ty, &self.text_format, value).map(Some).map_err(|e| match e {
+            Error::TypeMismatch { .. } => Error::TypeMismatch { column: self.name.clone() },
+            other => other,
+        })
+    }
+
     /// Sets the text format of a date/time column.
     pub fn text_format(mut self, format: impl Into<String>) -> Self {
         self.text_format = format.into();
@@ -92,11 +103,11 @@ impl Schema {
             if c.flags.index_equality && c.ty == ColumnType::Blob {
                 return Err(Error::InvalidSchema("Blob columns cannot be indexed"));
             }
-            if !c.text_format.is_empty() && !c.ty.is_temporal() {
-                return Err(Error::InvalidSchema("a text format is only for date/time columns"));
-            }
-            if c.text_format.contains('\0') {
-                return Err(Error::InvalidSchema("text formats contain no NUL"));
+            if !c.text_format.is_empty() {
+                if !c.ty.is_temporal() {
+                    return Err(Error::InvalidSchema("a text format is only for date/time columns"));
+                }
+                crate::datetime::validate(c.ty, &c.text_format)?;
             }
         }
         Ok(Self { columns })

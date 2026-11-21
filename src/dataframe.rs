@@ -180,6 +180,13 @@ impl<H: Heap> DataFrame<H> {
     fn prepare(&self, words: &mut WordStore<H>, entries: &mut BytesMut, column: &Column, value: &Value<'_>) -> Result<Prepared> {
         let start = entries.len();
         match (column.ty, value) {
+            (ty, Value::Str(text)) if ty.is_temporal() => {
+                let parsed = crate::datetime::parse(ty, &column.text_format, text).map_err(|e| match e {
+                    Error::DateParse { reason, .. } => Error::DateParse { column: column.name.clone(), reason },
+                    other => other,
+                })?;
+                Ok(Prepared::Cell(cell::encode(ty, &column.name, &parsed.as_value())?))
+            }
             (ty, _) if !ty.is_variable() => Ok(Prepared::Cell(cell::encode(ty, &column.name, value)?)),
             (_, Value::Null) => Ok(Prepared::Null),
             (ColumnType::String, Value::Str(text)) => {

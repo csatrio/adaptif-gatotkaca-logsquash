@@ -1701,6 +1701,86 @@ mod tests {
     }
 
     #[test]
+    fn date_and_time_columns_take_text_and_format_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Schema::new(vec![
+            Column::new("ts", ColumnType::TimestampMs).index_equality(),
+            Column::new("at", ColumnType::TimestampTz).text_format("builtin:clf"),
+            Column::new("day", ColumnType::Date).text_format("strftime:%d.%m.%Y"),
+            Column::new("clock", ColumnType::TimeOfDay),
+            Column::new("msg", ColumnType::String),
+        ])
+        .unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        let frame = store.create_frame("t", schema.clone()).unwrap();
+        let rows = [
+            ["2026-11-21T10:15:30.123Z", "21/Nov/2026:17:15:30 +0700", "21.11.2026", "10:15:30.5", "first"],
+            ["2026-11-20T23:59:59.999+01:00", "20/Nov/2026:23:59:59 -0500", "20.11.2026", "23:59:59", "second"],
+            ["2026-11-22 00:00:00.000", "22/Nov/2026:00:00:00 +0000", "22.11.2026", "00:00", "third"],
+        ];
+        for row in &rows {
+            frame.push_row(&row.map(Value::Str)).unwrap();
+        }
+        let first = frame.row(0).unwrap();
+        assert_eq!(first[0], OwnedValue::TimestampMs(1_795_256_130_123));
+        assert_eq!(first[1], OwnedValue::TimestampTz { millis: 1_795_256_130_000, offset_minutes: 420 });
+        assert_eq!((first[2].clone(), first[3].clone()), (OwnedValue::Date(20_778), OwnedValue::TimeOfDay(36_930_500_000_000)));
+        let shown = |row: u64, column: usize| schema.columns()[column].format_value(&frame.row(row).unwrap()[column]).unwrap().unwrap();
+        assert_eq!(shown(0, 0), "2026-11-21T10:15:30.123Z");
+        assert_eq!(shown(1, 0), "2026-11-20T22:59:59.999Z"); // the offset is folded into the UTC instant
+        assert_eq!(shown(1, 1), "20/Nov/2026:23:59:59 -0500"); // a TimestampTz keeps it
+        assert_eq!(shown(0, 2), "21.11.2026");
+        assert_eq!(shown(2, 3), "00:00:00.000000000");
+        assert_eq!(schema.columns()[4].format_value(&OwnedValue::Null).unwrap(), None);
+
+        // a bad value names its column and adds nothing, not even the new words of the other columns
+        let words_before = store.words().read().unwrap().word_count();
+        let bad = ["2026-11-21T10:15:30.123456Z", "21/Nov/2026:17:15:30 +0700", "21.11.2026", "10:15", "some new words"];
+        match frame.push_row(&bad.map(Value::Str)) {
+            Err(Error::DateParse { column, reason }) => assert_eq!((column.as_str(), reason.contains("precision")), ("ts", true)),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            frame.push_row(&[Value::TimestampSec(1), Value::Null, Value::Null, Value::Null, Value::Null]),
+            Err(Error::TypeMismatch { .. })
+        ));
+        assert_eq!((frame.len(), store.words().read().unwrap().word_count()), (3, words_before));
+
+        store.commit().unwrap();
+        frame.push_row(&rows[0].map(Value::Str)).unwrap(); // the same instant again, now in the buffer
+        for label in ["buffer + segment", "reopened"] {
+            let reopened;
+            let frame = if label == "reopened" {
+                store.commit().unwrap();
+                reopened = Store::open_read_only(dir.path(), options()).unwrap();
+                reopened.frame("t").unwrap()
+            } else {
+                frame.clone()
+            };
+            // text bounds are parsed with the column's format
+            let day_20 = Query::new().range(0, Some(Value::Str("2026-11-20T00:00:00Z")), Some(Value::Str("2026-11-20T23:59:59.999Z")));
+            assert_eq!(frame.search(&day_20).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>(), [1], "{label}");
+            let from_21 = Query::new().range(0, Some(Value::Str("2026-11-21")), None);
+            assert_eq!(frame.search(&from_21).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>(), [0, 2, 3], "{label}");
+            let same = Query::new().equals(0, Value::Str("2026-11-21T10:15:30.123Z"));
+            assert_eq!(frame.search(&same).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>(), [0, 3], "{label}");
+            let by_time = Page { order_by: Some(OrderBy { column: 0, descending: true }), offset: 0, limit: 10 };
+            assert_eq!(frame.search_page(&Query::new(), &by_time).unwrap().rows, [2, 0, 3, 1], "{label}");
+            assert!(matches!(frame.search(&Query::new().range(0, Some(Value::Str("yesterday")), None)), Err(Error::DateParse { .. })));
+        }
+    }
+
+    #[test]
+    fn schemas_reject_bad_text_formats() {
+        let bad = |ty, format: &str| matches!(Schema::new(vec![Column::new("c", ty).text_format(format)]), Err(Error::InvalidSchema(_)));
+        assert!(
+            bad(ColumnType::TimestampMs, "nonsense") && bad(ColumnType::TimestampMs, "strftime:%Q") && bad(ColumnType::Date, "builtin:clf")
+        );
+        assert!(bad(ColumnType::String, "builtin:iso8601") && bad(ColumnType::I64, "strftime:%Y"));
+        assert!(Schema::new(vec![Column::new("c", ColumnType::TimestampSec).text_format("builtin:rfc2822")]).is_ok());
+    }
+
+    #[test]
     fn empty_store_and_decode_value_helper() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::create(dir.path(), options()).unwrap();

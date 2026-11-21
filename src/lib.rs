@@ -10,6 +10,7 @@
 pub mod cell;
 pub(crate) mod codec;
 pub mod dataframe;
+pub mod datetime;
 pub mod dictionary;
 pub mod error;
 pub(crate) mod filebytes;
