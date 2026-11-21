@@ -11,7 +11,7 @@ use crate::varint;
 use crate::words::{SharedWords, WordStore};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 
 const TAG_WORD: u64 = 0;
 const TAG_CHAR: u64 = 1;
@@ -173,7 +173,7 @@ impl<H: Heap> Tokenizer<H> {
     }
 
     /// Decodes the stream at the start of `stream`, appends the text to `out` and returns the bytes consumed.
-    pub fn decode(&self, stream: &[u8], out: &mut Vec<u8>) -> Result<usize> {
+    pub fn decode(&self, stream: &[u8], out: &mut impl BufMut) -> Result<usize> {
         let words = self.words.read().expect("word store lock poisoned");
         decode_with(&words, stream, out)
     }
@@ -187,7 +187,7 @@ impl<H: Heap> Tokenizer<H> {
 }
 
 /// Decodes a stream using an already locked store; returns the number of bytes consumed.
-pub fn decode_with<H: Heap>(words: &WordStore<H>, stream: &[u8], out: &mut Vec<u8>) -> Result<usize> {
+pub fn decode_with<H: Heap>(words: &WordStore<H>, stream: &[u8], out: &mut impl BufMut) -> Result<usize> {
     let mut pos = 0;
     let count = varint::get(stream, &mut pos)?;
     for _ in 0..count {
@@ -195,14 +195,14 @@ pub fn decode_with<H: Heap>(words: &WordStore<H>, stream: &[u8], out: &mut Vec<u
         match value & 3 {
             TAG_WORD => {
                 let ordinal = u32::try_from(value >> 2).map_err(|_| Error::Corrupt("word ordinal out of range"))?;
-                out.extend_from_slice(words.get(ordinal).ok_or(Error::Corrupt("unknown word ordinal"))?.as_bytes());
+                out.put_slice(words.get(ordinal).ok_or(Error::Corrupt("unknown word ordinal"))?.as_bytes());
             }
             TAG_CHAR => {
                 let code = u32::try_from(value >> 2).ok().and_then(char::from_u32);
                 let c = code.ok_or(Error::Corrupt("invalid character"))?;
-                out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                out.put_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
             }
-            TAG_OPAQUE => out.extend_from_slice(take(stream, &mut pos, value >> 2)?),
+            TAG_OPAQUE => out.put_slice(take(stream, &mut pos, value >> 2)?),
             _ => {
                 let variant = ((value >> 2) & 7) as u8;
                 render(variant, take(stream, &mut pos, value >> 5)?, out)?;
@@ -259,19 +259,19 @@ fn take<'a>(stream: &'a [u8], pos: &mut usize, len: u64) -> Result<&'a [u8]> {
 }
 
 /// Writes the original text of a decoded inline run.
-fn render(variant: u8, raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
+fn render(variant: u8, raw: &[u8], out: &mut impl BufMut) -> Result<()> {
     match variant {
-        V_B64_STD => out.extend_from_slice(STANDARD.encode(raw).as_bytes()),
-        V_B64_STD_NO_PAD => out.extend_from_slice(STANDARD_NO_PAD.encode(raw).as_bytes()),
-        V_B64_URL => out.extend_from_slice(URL_SAFE.encode(raw).as_bytes()),
-        V_B64_URL_NO_PAD => out.extend_from_slice(URL_SAFE_NO_PAD.encode(raw).as_bytes()),
+        V_B64_STD => out.put_slice(STANDARD.encode(raw).as_bytes()),
+        V_B64_STD_NO_PAD => out.put_slice(STANDARD_NO_PAD.encode(raw).as_bytes()),
+        V_B64_URL => out.put_slice(URL_SAFE.encode(raw).as_bytes()),
+        V_B64_URL_NO_PAD => out.put_slice(URL_SAFE_NO_PAD.encode(raw).as_bytes()),
         V_UUID_LOWER | V_UUID_UPPER => {
             if raw.len() != 16 {
                 return Err(Error::Corrupt("UUID run is not 16 bytes"));
             }
             for (i, byte) in raw.iter().enumerate() {
                 if matches!(i, 4 | 6 | 8 | 10) {
-                    out.push(b'-');
+                    out.put_u8(b'-');
                 }
                 push_hex(out, *byte, variant == V_UUID_UPPER);
             }
@@ -281,10 +281,10 @@ fn render(variant: u8, raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn push_hex(out: &mut Vec<u8>, byte: u8, upper: bool) {
+fn push_hex(out: &mut impl BufMut, byte: u8, upper: bool) {
     let digits: &[u8; 16] = if upper { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
-    out.push(digits[(byte >> 4) as usize]);
-    out.push(digits[(byte & 15) as usize]);
+    out.put_u8(digits[(byte >> 4) as usize]);
+    out.put_u8(digits[(byte & 15) as usize]);
 }
 
 fn hex_value(b: u8) -> u8 {

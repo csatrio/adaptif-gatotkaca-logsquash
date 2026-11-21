@@ -13,6 +13,29 @@ pub enum Error {
     Corrupt(&'static str),
     /// An I/O error.
     Io(std::io::Error),
+    /// The schema is not valid.
+    InvalidSchema(&'static str),
+    /// A row has the wrong number of values.
+    ColumnCount {
+        /// Columns in the schema.
+        expected: usize,
+        /// Values in the row.
+        got: usize,
+    },
+    /// A value has the wrong kind for its column (for example text for an integer column).
+    TypeMismatch {
+        /// The column.
+        column: String,
+    },
+    /// A value is of the right kind but does not fit the column (for example 300 in an `i8` column).
+    ValueOutOfRange {
+        /// The column.
+        column: String,
+    },
+    /// A row number is past the end of the dataframe.
+    RowOutOfRange,
+    /// A column index is past the end of the schema.
+    ColumnOutOfRange,
 }
 
 /// Result alias using [`Error`].
@@ -25,6 +48,12 @@ impl fmt::Display for Error {
             Error::DictionaryFull => write!(f, "dictionary is full"),
             Error::Corrupt(what) => write!(f, "corrupt data: {what}"),
             Error::Io(e) => write!(f, "i/o error: {e}"),
+            Error::InvalidSchema(what) => write!(f, "invalid schema: {what}"),
+            Error::ColumnCount { expected, got } => write!(f, "row has {got} values, schema has {expected} columns"),
+            Error::TypeMismatch { column } => write!(f, "value has the wrong type for column {column:?}"),
+            Error::ValueOutOfRange { column } => write!(f, "value does not fit column {column:?}"),
+            Error::RowOutOfRange => write!(f, "row number out of range"),
+            Error::ColumnOutOfRange => write!(f, "column index out of range"),
         }
     }
 }
