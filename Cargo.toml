@@ -1,0 +1,28 @@
+[package]
+name = "adaptif-gatotkaca-logsquash"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+base64 = "0.23.1"
+bytes = "1.12.2"
+caseless = "0.2.2"
+chrono = "0.4.45"
+fs4 = "1.1.0"
+memmap2 = { version = "0.9.12", optional = true }
+serde = { version = "1.0.229", features = ["derive"], optional = true }
+serde_json = { version = "1.0.154", optional = true }
+xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
+zstd = "0.14.4"
+
+[dev-dependencies]
+criterion = "0.7.0"
+proptest = "1.11.0"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tempfile = "3.27.0"
+
+[features]
+default = ["mmap"]
+mmap = ["dep:memmap2"]
+json = ["dep:serde", "dep:serde_json"]
