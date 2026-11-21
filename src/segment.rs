@@ -26,7 +26,8 @@ use std::sync::{Arc, Mutex};
 const MAGIC: &[u8; 8] = b"LSQSEG01";
 const FOOTER_MAGIC: &[u8; 8] = b"LSQSEGEN";
 const FOOTER_LEN: u64 = 8 + 4 + 4 + 8 + 8;
-const CACHE_LIMIT: usize = 512;
+/// Default size limit of the decoded-block cache of one segment reader, in bytes.
+pub(crate) const DEFAULT_CACHE_BYTES: usize = 32 << 20;
 
 #[derive(Debug, Clone, Copy)]
 struct BlockRef {
@@ -216,7 +217,15 @@ enum Cached {
 pub(crate) struct SegmentReader {
     file: Mutex<File>,
     index: Index,
-    cache: Mutex<HashMap<CacheKey, Cached>>,
+    cache: Mutex<Cache>,
+    cache_limit: usize,
+}
+
+/// Decoded blocks kept for reuse, cleared when they exceed the size limit.
+#[derive(Default)]
+struct Cache {
+    map: HashMap<CacheKey, Cached>,
+    bytes: usize,
 }
 
 impl SegmentReader {
@@ -250,7 +259,7 @@ impl SegmentReader {
         if index.columns as usize != columns {
             return Err(Error::Corrupt("segment column count"));
         }
-        Ok(Self { file: Mutex::new(file), index, cache: Mutex::new(HashMap::new()) })
+        Ok(Self { file: Mutex::new(file), index, cache: Mutex::new(Cache::default()), cache_limit: DEFAULT_CACHE_BYTES })
     }
 
     /// Reads and checks every block of the segment.
@@ -262,6 +271,12 @@ impl SegmentReader {
             self.read_block(block)?;
         }
         Ok(())
+    }
+
+    /// Sets how many bytes of decoded blocks the reader may keep (default 32 MiB).
+    pub(crate) fn with_cache_limit(mut self, bytes: usize) -> Self {
+        self.cache_limit = bytes;
+        self
     }
 
     /// Number of rows.
@@ -289,17 +304,19 @@ impl SegmentReader {
         zstd::bulk::decompress(&comp, block.raw_len as usize).map_err(|_| Error::Corrupt("block does not decompress"))
     }
 
-    fn remember(&self, key: CacheKey, value: Cached) {
+    fn remember(&self, key: CacheKey, value: Cached, size: usize) {
         let mut cache = self.cache.lock().expect("segment cache lock poisoned");
-        if cache.len() >= CACHE_LIMIT {
-            cache.clear();
+        if cache.bytes + size > self.cache_limit {
+            cache.map.clear();
+            cache.bytes = 0;
         }
-        cache.insert(key, value);
+        cache.bytes += size;
+        cache.map.insert(key, value);
     }
 
     fn column_data(&self, block: u64, column: u32) -> Result<Arc<ColumnData>> {
         let key = CacheKey::Column { block, column };
-        if let Some(Cached::Column(data)) = self.cache.lock().expect("segment cache lock poisoned").get(&key) {
+        if let Some(Cached::Column(data)) = self.cache.lock().expect("segment cache lock poisoned").map.get(&key) {
             return Ok(Arc::clone(data));
         }
         let entry = &self.index.column_blocks[block as usize * self.index.columns as usize + column as usize];
@@ -318,17 +335,18 @@ impl SegmentReader {
             }
         }
         let data = Arc::new(ColumnData { cells, nulls: (flags == 1).then(|| bitmap.to_vec()) });
-        self.remember(key, Cached::Column(Arc::clone(&data)));
+        let size = data.cells.len() * 8 + data.nulls.as_ref().map_or(0, Vec::len);
+        self.remember(key, Cached::Column(Arc::clone(&data)), size);
         Ok(data)
     }
 
     fn heap_block(&self, index: usize) -> Result<Arc<Vec<u8>>> {
         let key = CacheKey::Heap(index);
-        if let Some(Cached::Heap(data)) = self.cache.lock().expect("segment cache lock poisoned").get(&key) {
+        if let Some(Cached::Heap(data)) = self.cache.lock().expect("segment cache lock poisoned").map.get(&key) {
             return Ok(Arc::clone(data));
         }
         let data = Arc::new(self.read_block(&self.index.heap_blocks[index].1)?);
-        self.remember(key, Cached::Heap(Arc::clone(&data)));
+        self.remember(key, Cached::Heap(Arc::clone(&data)), data.len());
         Ok(data)
     }
 

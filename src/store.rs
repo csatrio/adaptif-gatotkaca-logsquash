@@ -53,10 +53,12 @@ pub struct StoreOptions {
     pub segment_rows: usize,
     /// Rows per column block (default 4,096).
     pub block_rows: usize,
-    /// Target size of a row-heap block in bytes (default 64 KiB).
+    /// Target size of a row-heap block in bytes (default 1 MiB; bigger compresses better but makes random row reads slower).
     pub row_heap_block_bytes: usize,
     /// Target size of a heap block in bytes (default 1 MiB).
     pub heap_block_bytes: usize,
+    /// Bytes of decoded blocks each segment reader keeps for reuse (default 32 MiB).
+    pub cache_bytes: usize,
     /// Write search index files when committing (default true). Without them, searches scan the rows; the indexes can
     /// be built later with [`Store::build_indexes`].
     pub indexing: bool,
@@ -74,8 +76,9 @@ impl Default for StoreOptions {
             zstd_level: 19,
             segment_rows: 100_000,
             block_rows: 4096,
-            row_heap_block_bytes: 64 * 1024,
+            row_heap_block_bytes: 1 << 20,
             heap_block_bytes: 1 << 20,
+            cache_bytes: crate::segment::DEFAULT_CACHE_BYTES,
             indexing: true,
             compress_indexes: true,
         }
@@ -678,7 +681,7 @@ impl Store {
             let mut segments = Vec::new();
             let mut start = 0;
             for segment in &meta.segments {
-                let reader = SegmentReader::open(&dir.join(&segment.file), meta.schema.len())?;
+                let reader = SegmentReader::open(&dir.join(&segment.file), meta.schema.len())?.with_cache_limit(options.cache_bytes);
                 if reader.rows() != segment.rows {
                     return Err(Error::Corrupt("segment row count differs from the manifest"));
                 }
@@ -891,7 +894,7 @@ impl Store {
         // The manifest is replaced: the commit happened. Now switch the in-memory state over.
         for (i, file, rows) in written {
             let guard = &mut guards[i];
-            let reader = SegmentReader::open(&self.dir.join(&file), frames[i].schema.len())?;
+            let reader = SegmentReader::open(&self.dir.join(&file), frames[i].schema.len())?.with_cache_limit(self.options.cache_bytes);
             let start = guard.committed_rows;
             let index_path = self.dir.join(file.replace(".seg", ".idx"));
             let index = if index_path.exists() { Some(SegmentIndex::open(&index_path)?) } else { None };

@@ -26,3 +26,7 @@ tempfile = "3.27.0"
 default = ["mmap"]
 mmap = ["dep:memmap2"]
 json = ["dep:serde", "dep:serde_json"]
+
+[[bench]]
+name = "store"
+harness = false

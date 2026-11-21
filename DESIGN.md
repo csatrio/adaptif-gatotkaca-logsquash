@@ -19,7 +19,7 @@ A library that stores logs in a compact binary dataframe. Strings are compressed
 | Dictionary | In-memory map from `hash(word, salt)` to ordinal, persisted across sessions (5.2). |
 | Row heap | Per-segment, append-only store of symbol streams and blobs (6.4). |
 | Segment | One file of up to 100,000 rows of a dataframe (6.3). |
-| Block | A compressed unit inside a file (a run of heap words, 4096 rows of one column, or about 64 KiB of row heap). |
+| Block | A compressed unit inside a file (a run of heap words, 4096 rows of one column, or about 1 MiB of row heap). |
 | Folder / generation | A store directory holding a manifest, the heap/dictionary and dataframe segments. A new one starts when the dictionary is full (7). |
 
 ## 3. Components
@@ -143,7 +143,7 @@ A dataframe is stored as one or more **segment files** (Q78). Each **commit** wr
 
 ### 6.4 Row heap
 - Per segment; append-only; holds the symbol streams (4.3) of string cells and the raw bytes of blob cells. A string entry is `[varint symbol count][symbols]`; a blob entry is `[varint length][bytes]`.
-- Stored in zstd blocks of about 64 KiB uncompressed. An entry never crosses a block. A cell's logical offset locates its block through the block index.
+- Stored in zstd blocks of about 1 MiB uncompressed (`row_heap_block_bytes`; chosen in milestone 6, see 13). An entry never crosses a block. A cell's logical offset locates its block through the block index. Reading one row decompresses the row-heap block of each of its string cells, so larger blocks compress better but make a random single-row read slower.
 - **Whole-string dedup:** the in-memory buffer of a dataframe keeps a map `xxh3_64(entry bytes) -> logical offset`. An identical entry (bytes compared) is reused, so identical strings cost one cell each. The map is capped at 4,000,000 entries and starts empty again after each commit (so identical strings in different segments are stored once per segment); once full, new entries are written normally but are not added to the map. Blobs are not deduplicated.
 
 ### 6.5 Search and filters
@@ -285,7 +285,7 @@ A store is a **folder** covering one day or other time period. All its dataframe
 | 83 | Corpus mapping? | One wide dataframe for runs and events together (`kind` column tells them apart). |
 | 84 | Dictionary on disk? | Not stored; rebuilt from the length-prefixed heap when a folder is opened. |
 | 85 | Server scope? | Library only; the server and the web app are separate projects. |
-| 86 | Default thresholds? | Base64 run 64+, opaque run 24+, hex run 16+, segment 100,000 rows, column block 4,096 rows, row-heap block 64 KiB, zstd 19, dictionary entry cost 32 bytes. All settings, tuned after measuring. |
+| 86 | Default thresholds? | Base64 run 64+, opaque run 24+, hex run 16+, segment 100,000 rows, column block 4,096 rows, row-heap block 1 MiB (changed from 64 KiB in milestone 6), zstd 19, dictionary entry cost 32 bytes. All settings, tuned after measuring. |
 | 87 | Opaque run test? | Shannon entropy per character (4.0 bits default), not already in the dictionary. |
 | 88 | UUID / hex ids? | UUIDs and long hex runs are stored decoded inline (tag 11 variants 4-7). |
 | 89 | Search indexes? | Persisted per segment (logs are immutable); per-column index flags; memory-mapped for reads. |
@@ -298,12 +298,13 @@ A store is a **folder** covering one day or other time period. All its dataframe
 | 96 | Index compression? | Compressed index files by default (`compress_indexes`); plain mmap-able files remain an option. |
 | 97 | Indexing optional? | Yes: `StoreOptions::indexing`; `Store::build_indexes` builds missing indexes later from the stored segments and heap. |
 | 98 | Date/time parsing details? | ISO-8601/RFC-3339, RFC-2822, CLF and strftime; UTC when no offset; errors for finer-than-unit precision, leap seconds, offsets with seconds and out-of-range values; text accepted on insert and in filters. |
+| 99 | Tuned defaults? | Row-heap block 1 MiB (was 64 KiB: -10% total size, random row read about 0.85 ms instead of 0.36 ms); everything else kept (zstd 19, 4,096-row column blocks, 100,000-row segments, inline-run thresholds). A trained zstd dictionary was tried and rejected (see 13). Decoded-block cache is bounded by bytes (`cache_bytes`, 32 MiB per segment). |
 | (note) | Folder = period | A folder covers a day or other period and is shared by all its dataframes; on rotation the dictionary is dropped, the heap and indexes stay. |
 
 ## 9. Open Questions
-- Entropy thresholds (4.5 base64, 4.0 opaque) are guesses; calibrate on the corpus in milestone 1.
+- Entropy thresholds: settled in milestone 6 (the sizes are insensitive to them, see 13).
 - Index files are about 3% of raw when compressed, 7.8% when plain; the whole corpus with every index flag set is 28.2% of raw (see 13). Consider flagging fewer columns only if a future corpus misses the 30% target.
-- Thresholds to measure: base64 run length (64), opaque run length (24), segment size (100,000 rows), column block size (4,096 rows), row-heap block size (64 KiB), zstd level, per-entry dictionary cost estimate (32 bytes).
+- Row-heap block size trades size against random-read latency (1 MiB default; 4 MiB is 6% smaller but 2.2 times slower per random row); a deployment that cares more about one or the other can change `StoreOptions::row_heap_block_bytes`.
 - MSRV: `caseless` does not declare a minimum Rust version; `rust-version = "1.85"` is not yet verified against it.
 
 ## 10. Crate Layout and Dependencies
@@ -400,4 +401,55 @@ These findings drove the symbol encoding (4.3), inline base64/opaque runs (4.2),
 | whole corpus (775.5 MB) | 194.56 MB = 25.1% (was 25.6% with timestamps as text) | 218.66 MB = 28.2% |
 
   A time-range query on the whole corpus (`ts` between two ISO strings) returns the same 1,247 rows with and without indexes, in about 0.1 ms either way (the range filter uses the per-block minimum and maximum).
-- Next: benchmarks and tuning (milestone 6).
+- **Milestone 6 done: benchmarks and tuning.** New: `benches/store.rs` (criterion, synthetic logs), `examples/tune_corpus.rs` (parameter sweeps on real logs), `examples/dict_experiment.rs`, a byte-bounded block cache (`StoreOptions::cache_bytes`), and a new default row-heap block size. 96 tests pass and clippy is clean.
+
+**Sweeps** (`tune_corpus`; every search index on and compressed, zstd 19; totals include indexes and are % of raw; sample = every 10th file, 90.5 MB; "row" is the average of 2,000 random single-row reads on a freshly opened store, so mostly cold):
+
+| Setting | Values tried and totals (sample) | Decision |
+|---|---|---|
+| zstd level | 3: 33.6%, 9: 31.7%, 15: 31.2%, 19: 30.8%, 22: 30.8% (write 1.4 s, 1.8 s, 4.8 s, 11.9 s, 17.2 s) | keep 19 (22 gains nothing) |
+| column block rows | 512: 31.2% (row 166 us), 1,024: 31.0%, 2,048: 30.9%, 4,096: 30.8% (row 438 us), 8,192: 30.8%, 16,384: 30.7% | keep 4,096 |
+| segment rows | 25,000: 31.2%, 50,000: 31.0%, 100,000 and 200,000: 30.8% (whole corpus: 400,000 is no smaller than 100,000 with 4 MiB blocks: 24.06% vs 24.00%) | keep 100,000 |
+| row-heap block bytes | 16 KiB: 32.3%, 32 KiB: 31.5%, 64 KiB: 30.8%, 128 KiB: 30.2%, 256 KiB: 29.6%, 1 MiB: 28.2%, 2 MiB: 27.5%, 4 MiB: 27.1%, 16 MiB: 26.2% (row 0.4 ms at 64 KiB, 0.9 ms at 1 MiB, 1.5 ms at 4 MiB, 1.9 ms at 16 MiB) | **1 MiB** |
+| opaque run (entropy 3.0-5.0, length 16-48 or off) | 28.2-28.3% in every case | keep 4.0 / 24 (they only keep one-off ids out of the dictionary) |
+| hex run (length 8, 32, or off) | 28.2% | keep 16 |
+| base64 run (length 32-256, entropy 3.5-5.0) | 28.2% in every case | keep 64 / 4.5 |
+| inline detection fully off (base64, hex and opaque) | 38.0%: the 20 MB of base64 text becomes 733,000 heap words (15 MB heap file, bigger indexes) | inline runs are worth about 10 points |
+| base64 detection off only | 34.9% | (base64 decoding is the important one) |
+
+**Whole corpus** (775.5 MB, all indexes compressed, zstd 19):
+
+| Row-heap block | Total | Random row read | Sequential hydration |
+|---|---|---|---|
+| 64 KiB (old default) | 28.28% | 0.36 ms | 162,000 rows/s |
+| **1 MiB (new default)** | **25.48%** | 0.85 ms | 170,000 rows/s |
+| 4 MiB | 24.00% | 1.9 ms | 172,000 rows/s |
+| 4 MiB, 400,000-row segments | 24.06% | 2.5 ms | 167,000 rows/s |
+| 4 MiB, 1,024-row column blocks | 24.20% | 1.4 ms | 169,000 rows/s |
+
+The 1 MiB default makes the whole corpus 25.5% of raw with every index (segments 172.2 MB, indexes 24.1 MB, heap 0.7 MB), a fifth under the 30% target. Opening a store read-only takes about 80-90 ms on the whole corpus; a word search takes 0.09 ms.
+
+**Trained zstd dictionary: rejected.** On the row heap of the sample (61.5 MB), 64 KiB blocks compress to 24.6 MB independently, 23.5 MB with a 128 KiB dictionary trained on other blocks, but 22.2 MB as plain 1 MiB blocks; a dictionary on top of 1 MiB blocks gains only 0.3 MB more. Larger blocks are the cheaper lever, with no extra file or format.
+
+**Criterion benchmarks** (`cargo bench --bench store -- --quick`, 100,000 synthetic rows, zstd 3, warm cache, one machine; the synthetic rows are far smaller than the real logs, so absolute numbers are indicative only; cold reads on real logs are in the sweep above):
+
+| Benchmark | Time |
+|---|---|
+| tokenize 1,000 JSON strings | 0.98 ms (116 MiB/s) |
+| `push_row` x 1,000 in memory | 2.0 ms (496,000 rows/s) |
+| commit 20,000 rows with indexes | 73 ms |
+| `build_indexes` for 4 segments of 5,000 rows | 75 ms |
+| `open_read_only` (100,000 rows) | 3.6 ms |
+| hydrate one row (cached) / 100 consecutive rows | 1.7 us / 154 us |
+| word search (`rejected`) / case-insensitive | 72 us / 71 us |
+| equality, level = ERROR | 158 us |
+| word + equality + range | 249 us |
+| time range with text bounds | 15 us |
+| word in JSON text | 595 us |
+| page of 50 sorted by id | 0.78 ms |
+| prefix suggestions | 0.23 us |
+| phrase `attempt 3` | 39.7 ms (every row contains `attempt`, so all 100,000 candidates are verified) |
+| single-character word `:` | 35.6 ms (scan) |
+
+Things the benchmarks make visible: a phrase made of very common words (or single characters) falls back to verifying many rows and takes tens of milliseconds, and a single-character word always scans.
+- Next: nothing is planned; remaining work is whatever the user asks for next.

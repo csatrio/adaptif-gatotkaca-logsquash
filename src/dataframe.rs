@@ -27,7 +27,7 @@ pub struct DataFrameOptions {
 
 impl Default for DataFrameOptions {
     fn default() -> Self {
-        Self { tokenizer: TokenizerOptions::default(), dedup_entries: 4_000_000, row_heap_block_bytes: 64 * 1024 }
+        Self { tokenizer: TokenizerOptions::default(), dedup_entries: 4_000_000, row_heap_block_bytes: 1 << 20 }
     }
 }
 
