@@ -36,6 +36,16 @@ pub enum Error {
     RowOutOfRange,
     /// A column index is past the end of the schema.
     ColumnOutOfRange,
+    /// The store was opened read-only, or has been sealed.
+    ReadOnly,
+    /// Another process has the store open for writing.
+    Locked,
+    /// No dataframe with that name exists.
+    UnknownFrame,
+    /// A dataframe with that name exists already.
+    FrameExists,
+    /// The files were written by a newer, incompatible version.
+    UnsupportedVersion,
 }
 
 /// Result alias using [`Error`].
@@ -54,6 +64,11 @@ impl fmt::Display for Error {
             Error::ValueOutOfRange { column } => write!(f, "value does not fit column {column:?}"),
             Error::RowOutOfRange => write!(f, "row number out of range"),
             Error::ColumnOutOfRange => write!(f, "column index out of range"),
+            Error::ReadOnly => write!(f, "the store is read-only"),
+            Error::Locked => write!(f, "the store is locked by another process"),
+            Error::UnknownFrame => write!(f, "no such dataframe"),
+            Error::FrameExists => write!(f, "a dataframe with that name exists already"),
+            Error::UnsupportedVersion => write!(f, "unsupported format version"),
         }
     }
 }

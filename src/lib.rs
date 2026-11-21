@@ -8,12 +8,15 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod cell;
+pub(crate) mod codec;
 pub mod dataframe;
 pub mod dictionary;
 pub mod error;
 pub mod heap;
 pub mod schema;
+pub(crate) mod segment;
 pub mod splitter;
+pub mod store;
 pub mod tokenizer;
 pub mod types;
 pub mod varint;
@@ -25,6 +28,7 @@ pub use error::{Error, Result};
 pub use heap::{Heap, MemHeap};
 pub use schema::{Column, ColumnFlags, Schema};
 pub use splitter::{DefaultSplitter, JsonEscapeSplitter, Splitter};
+pub use store::{Frame, FrameRows, Store, StoreOptions};
 pub use tokenizer::{StreamStats, Tokenizer, TokenizerOptions, analyze};
 pub use types::{ColumnType, OwnedValue, Value};
 pub use words::{Checkpoint, SharedWords, WordStore};

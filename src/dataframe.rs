@@ -21,23 +21,25 @@ pub struct DataFrameOptions {
     pub tokenizer: TokenizerOptions,
     /// Maximum entries of the whole-string dedup map; once full, new strings are stored but not remembered.
     pub dedup_entries: usize,
+    /// Target size of a row-heap block in bytes (an entry never crosses a block boundary).
+    pub row_heap_block_bytes: usize,
 }
 
 impl Default for DataFrameOptions {
     fn default() -> Self {
-        Self { tokenizer: TokenizerOptions::default(), dedup_entries: 1_000_000 }
+        Self { tokenizer: TokenizerOptions::default(), dedup_entries: 4_000_000, row_heap_block_bytes: 64 * 1024 }
     }
 }
 
 /// One bit per row, set for null.
 #[derive(Default)]
-struct NullBits {
+pub(crate) struct NullBits {
     words: Vec<u64>,
     len: usize,
 }
 
 impl NullBits {
-    fn push(&mut self, null: bool) {
+    pub(crate) fn push(&mut self, null: bool) {
         if self.len % 64 == 0 {
             self.words.push(0);
         }
@@ -47,24 +49,26 @@ impl NullBits {
         self.len += 1;
     }
 
-    fn get(&self, index: usize) -> bool {
+    pub(crate) fn get(&self, index: usize) -> bool {
         (self.words[index / 64] >> (index % 64)) & 1 == 1
     }
 }
 
 #[derive(Default)]
-struct ColumnData {
+pub(crate) struct ColumnData {
     /// Fixed-size types: the encoded value. String/Blob: row-heap offset + 1.
-    cells: Vec<u64>,
-    nulls: NullBits,
+    pub(crate) cells: Vec<u64>,
+    pub(crate) nulls: NullBits,
 }
 
 #[derive(Default)]
-struct Inner {
-    columns: Vec<ColumnData>,
-    rows: u64,
+pub(crate) struct Inner {
+    pub(crate) columns: Vec<ColumnData>,
+    pub(crate) rows: u64,
     /// Symbol streams of strings and `[varint length][bytes]` blobs, back to back.
-    row_heap: BytesMut,
+    pub(crate) row_heap: BytesMut,
+    /// Start offsets of the row-heap blocks (an entry never crosses a block boundary).
+    pub(crate) block_starts: Vec<u64>,
     /// Whole-string dedup: hash of an entry -> (offset, length).
     dedup: HashMap<u64, (u64, u32)>,
     scratch: BytesMut,
@@ -87,6 +91,7 @@ pub struct DataFrame<H: Heap = MemHeap> {
     schema: Arc<Schema>,
     tokenizer: Tokenizer<H>,
     dedup_entries: usize,
+    block_bytes: u64,
     inner: RwLock<Inner>,
 }
 
@@ -103,6 +108,7 @@ impl<H: Heap> DataFrame<H> {
             schema: Arc::new(schema),
             tokenizer: Tokenizer::new(words, options.tokenizer),
             dedup_entries: options.dedup_entries,
+            block_bytes: options.row_heap_block_bytes.max(1) as u64,
             inner: RwLock::new(Inner { columns, ..Inner::default() }),
         }
     }
@@ -129,7 +135,7 @@ impl<H: Heap> DataFrame<H> {
             return Err(Error::ColumnCount { expected: columns.len(), got: row.len() });
         }
         let mut guard = self.inner.write().expect("dataframe lock poisoned");
-        let Inner { columns: data, rows, row_heap, dedup, scratch } = &mut *guard;
+        let Inner { columns: data, rows, row_heap, block_starts, dedup, scratch } = &mut *guard;
         let mut entries = std::mem::take(scratch);
         entries.clear();
 
@@ -159,7 +165,8 @@ impl<H: Heap> DataFrame<H> {
                     column.nulls.push(true);
                 }
                 Prepared::Entry { start, end, dedup: remember } => {
-                    let offset = store_entry(row_heap, dedup, self.dedup_entries, &entries[start..end], remember);
+                    let cap = (self.dedup_entries, self.block_bytes);
+                    let offset = store_entry(row_heap, block_starts, dedup, cap, &entries[start..end], remember);
                     column.cells.push(offset + 1);
                     column.nulls.push(false);
                 }
@@ -206,7 +213,7 @@ impl<H: Heap> DataFrame<H> {
     /// Writes the text of a string cell into `out` without allocating a `String`. Returns `false` for null.
     pub fn write_string(&self, row: u64, column: usize, out: &mut BytesMut) -> Result<bool> {
         let inner = self.inner.read().expect("dataframe lock poisoned");
-        let words = self.tokenizer.words().read().expect("word store lock poisoned");
+        let words: std::sync::RwLockReadGuard<'_, WordStore<H>> = self.tokenizer.words().read().expect("word store lock poisoned");
         let col = self.check(&inner, row, column)?;
         if col.ty != ColumnType::String {
             return Err(Error::TypeMismatch { column: col.name.clone() });
@@ -240,6 +247,19 @@ impl<H: Heap> DataFrame<H> {
         self.inner.read().expect("dataframe lock poisoned").dedup.len()
     }
 
+    /// Runs `f` on the buffered rows (used when writing a segment).
+    pub(crate) fn with_inner<R>(&self, f: impl FnOnce(&Inner) -> R) -> R {
+        f(&self.inner.read().expect("dataframe lock poisoned"))
+    }
+
+    /// Drops all rows (after they were written to a segment). Keeps the allocations.
+    pub(crate) fn clear(&self) {
+        let mut inner = self.inner.write().expect("dataframe lock poisoned");
+        let count = inner.columns.len();
+        let scratch = std::mem::take(&mut inner.scratch);
+        *inner = Inner { columns: (0..count).map(|_| ColumnData::default()).collect(), scratch, ..Inner::default() };
+    }
+
     fn check(&self, inner: &Inner, row: u64, column: usize) -> Result<&Column> {
         let col = self.schema.columns().get(column).ok_or(Error::ColumnOutOfRange)?;
         if row >= inner.rows {
@@ -252,29 +272,22 @@ impl<H: Heap> DataFrame<H> {
         let col = self.check(inner, row, column)?;
         let data = &inner.columns[column];
         let cell = data.cells[row as usize];
-        if data.nulls.get(row as usize) {
-            return Ok(OwnedValue::Null);
-        }
-        match col.ty {
-            ColumnType::String => {
-                let mut text = Vec::new();
-                decode_with(words, &inner.row_heap[(cell - 1) as usize..], &mut text)?;
-                String::from_utf8(text).map(OwnedValue::Str).map_err(|_| Error::Corrupt("string is not UTF-8"))
-            }
-            ColumnType::Blob => {
-                let heap: &[u8] = &inner.row_heap;
-                let mut pos = (cell - 1) as usize;
-                let len = varint::get(heap, &mut pos)? as usize;
-                let bytes = heap.get(pos..pos.checked_add(len).ok_or(Error::Corrupt("blob length"))?);
-                bytes.map(|b| OwnedValue::Blob(b.to_vec())).ok_or(Error::Corrupt("blob is cut off"))
-            }
-            ty => Ok(cell::decode(ty, cell)),
-        }
+        let null = data.nulls.get(row as usize);
+        let tail = if col.ty.is_variable() && !null { &inner.row_heap[(cell - 1) as usize..] } else { &[] };
+        decode_value(col.ty, null, cell, tail, words)
     }
 }
 
 /// Appends `bytes` to the row heap (or reuses an identical earlier entry when `remember` is set); returns its offset.
-fn store_entry(heap: &mut BytesMut, map: &mut HashMap<u64, (u64, u32)>, cap: usize, bytes: &[u8], remember: bool) -> u64 {
+/// `cap` is `(dedup map capacity, target block bytes)`.
+fn store_entry(
+    heap: &mut BytesMut,
+    block_starts: &mut Vec<u64>,
+    map: &mut HashMap<u64, (u64, u32)>,
+    cap: (usize, u64),
+    bytes: &[u8],
+    remember: bool,
+) -> u64 {
     let key = remember.then(|| xxh3(bytes, 0));
     if let Some(key) = key {
         if let Some(&(offset, len)) = map.get(&key) {
@@ -285,13 +298,37 @@ fn store_entry(heap: &mut BytesMut, map: &mut HashMap<u64, (u64, u32)>, cap: usi
         }
     }
     let offset = heap.len() as u64;
+    if block_starts.last().is_none_or(|&last| offset - last >= cap.1) {
+        block_starts.push(offset);
+    }
     heap.put_slice(bytes);
     if let Some(key) = key {
-        if map.len() < cap {
+        if map.len() < cap.0 {
             map.entry(key).or_insert((offset, bytes.len() as u32));
         }
     }
     offset
+}
+
+/// Decodes one cell into a value. `heap_tail` starts at the entry of a string or blob cell (it may run on past the entry).
+pub(crate) fn decode_value<H: Heap>(ty: ColumnType, null: bool, cell: u64, heap_tail: &[u8], words: &WordStore<H>) -> Result<OwnedValue> {
+    if null {
+        return Ok(OwnedValue::Null);
+    }
+    match ty {
+        ColumnType::String => {
+            let mut text = Vec::new();
+            decode_with(words, heap_tail, &mut text)?;
+            String::from_utf8(text).map(OwnedValue::Str).map_err(|_| Error::Corrupt("string is not UTF-8"))
+        }
+        ColumnType::Blob => {
+            let mut pos = 0;
+            let len = varint::get(heap_tail, &mut pos)? as usize;
+            let bytes = heap_tail.get(pos..pos.checked_add(len).ok_or(Error::Corrupt("blob length"))?);
+            bytes.map(|b| OwnedValue::Blob(b.to_vec())).ok_or(Error::Corrupt("blob is cut off"))
+        }
+        ty => Ok(cell::decode(ty, cell)),
+    }
 }
 
 /// Iterator over the rows of a [`DataFrame`].
