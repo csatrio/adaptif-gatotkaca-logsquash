@@ -3,6 +3,16 @@ name = "adaptif-gatotkaca-logsquash"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+authors = ["PT Adaptif Sinergi Dinamis"]
+description = "Log squasher: stores logs in compact binary dataframes (word-level string dedup, tagged varint symbols, zstd blocks) with persisted word, equality and range indexes, for small files and fast search and rehydration."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+homepage = "https://adaptif.co.id/"
+repository = "https://github.com/csatrio/adaptif-gatotkaca-logsquash"
+documentation = "https://docs.rs/adaptif-gatotkaca-logsquash"
+keywords = ["logs", "compression", "search", "dataframe", "zstd"]
+categories = ["compression", "database-implementations", "data-structures"]
+include = ["src/**", "examples/**", "benches/**", "Cargo.toml", "README.md", "AGENTS.md", "CHANGELOG.md", "DESIGN.md", "LICENSE-*"]
 
 [dependencies]
 base64 = "0.23.1"
