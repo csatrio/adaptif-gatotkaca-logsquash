@@ -251,6 +251,39 @@ pub fn analyze(stream: &[u8]) -> Result<StreamStats> {
     Ok(stats)
 }
 
+/// A symbol of a stream at word level (inline runs are not words and never match a search).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Symbol {
+    /// A word of the heap, by ordinal.
+    Word(u32),
+    /// A single character.
+    Char(char),
+    /// An inline run (opaque, base64, UUID or hex).
+    Inline,
+}
+
+/// Parses the stream at the start of `stream` into word-level symbols.
+pub fn symbols(stream: &[u8]) -> Result<Vec<Symbol>> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for _ in 0..varint::get(stream, &mut pos)? {
+        let value = varint::get(stream, &mut pos)?;
+        out.push(match value & 3 {
+            TAG_WORD => Symbol::Word(u32::try_from(value >> 2).map_err(|_| Error::Corrupt("word ordinal out of range"))?),
+            TAG_CHAR => Symbol::Char(u32::try_from(value >> 2).ok().and_then(char::from_u32).ok_or(Error::Corrupt("invalid character"))?),
+            TAG_OPAQUE => {
+                take(stream, &mut pos, value >> 2)?;
+                Symbol::Inline
+            }
+            _ => {
+                take(stream, &mut pos, value >> 5)?;
+                Symbol::Inline
+            }
+        });
+    }
+    Ok(out)
+}
+
 fn take<'a>(stream: &'a [u8], pos: &mut usize, len: u64) -> Result<&'a [u8]> {
     let end = usize::try_from(len).ok().and_then(|len| pos.checked_add(len)).ok_or(Error::Corrupt("run length"))?;
     let bytes = stream.get(*pos..end).ok_or(Error::Corrupt("inline run is cut off"))?;

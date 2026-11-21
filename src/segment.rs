@@ -253,6 +253,17 @@ impl SegmentReader {
         Ok(Self { file: Mutex::new(file), index, cache: Mutex::new(HashMap::new()) })
     }
 
+    /// Reads and checks every block of the segment.
+    pub(crate) fn verify(&self) -> Result<()> {
+        for entry in &self.index.column_blocks {
+            self.read_block(&entry.block)?;
+        }
+        for (_, block) in &self.index.heap_blocks {
+            self.read_block(block)?;
+        }
+        Ok(())
+    }
+
     /// Number of rows.
     pub(crate) fn rows(&self) -> u64 {
         self.index.rows
@@ -333,7 +344,7 @@ impl SegmentReader {
         Ok((block, pos))
     }
 
-    fn cell(&self, row: u64, column: usize) -> Result<(u64, bool)> {
+    pub(crate) fn cell(&self, row: u64, column: usize) -> Result<(u64, bool)> {
         if row >= self.index.rows || column >= self.index.columns as usize {
             return Err(Error::RowOutOfRange);
         }
@@ -341,6 +352,35 @@ impl SegmentReader {
         let data = self.column_data(row / block_rows, column as u32)?;
         let i = (row % block_rows) as usize;
         Ok((data.cells[i], data.is_null(i)))
+    }
+
+    /// Calls `f` with the row-heap bytes starting at the entry of a string cell.
+    pub(crate) fn with_entry(&self, cell: u64, f: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let (block, pos) = self.heap_at(cell - 1)?;
+        f(&block[pos..])
+    }
+
+    /// Rows whose non-null cell in `column` lies in `lo..=hi`, skipping blocks by their minimum and maximum.
+    pub(crate) fn range(&self, column: usize, lo: u64, hi: u64) -> Result<Vec<u32>> {
+        let columns = self.index.columns as usize;
+        if column >= columns {
+            return Err(Error::ColumnOutOfRange);
+        }
+        let block_rows = u64::from(self.index.block_rows);
+        let mut rows = Vec::new();
+        for block in 0..self.index.rows.div_ceil(block_rows) {
+            let stats = &self.index.column_blocks[block as usize * columns + column];
+            if stats.non_null == 0 || stats.max < lo || stats.min > hi {
+                continue;
+            }
+            let data = self.column_data(block, column as u32)?;
+            for (i, &c) in data.cells.iter().enumerate() {
+                if !data.is_null(i) && (lo..=hi).contains(&c) {
+                    rows.push((block * block_rows) as u32 + i as u32);
+                }
+            }
+        }
+        Ok(rows)
     }
 
     /// Reads one value.

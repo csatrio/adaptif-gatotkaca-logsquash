@@ -137,15 +137,24 @@ A dataframe is stored as one or more **segment files** (Q78). Each **commit** wr
 - **Whole-string dedup:** the in-memory buffer of a dataframe keeps a map `xxh3_64(entry bytes) -> logical offset`. An identical entry (bytes compared) is reused, so identical strings cost one cell each. The map is capped at 4,000,000 entries and starts empty again after each commit (so identical strings in different segments are stored once per segment); once full, new entries are written normally but are not added to the map. Blobs are not deduplicated.
 
 ### 6.5 Search and filters
-The viewer needs: word/phrase search, equality filters, a time range, sorting and pagination (Q82). Logs are immutable and only searched, so **indexes are persisted** (Q89) in per-segment index files and read through `memmap2`, which makes reads cheap (Q93).
-- **Per-column index flag:** `none`, `equality`, `words` or both. Index files only cover flagged columns, so file size stays under control: the transcripts corpus would index `text` and `data` by words and `kind`, `type`, `subtype`, `tool`, `run_id` and `project_id` by equality. (A Python estimate for the 91k-row sample: about 2.8M word postings for `text` and `data`, roughly 4 MB with delta-varint postings, which is about 4-5% of the raw size and about 15% of the 25 MB stored size; indexing every column would add roughly another 1 MB.)
-- **Word index** (per segment): a sorted directory of `(column, word ordinal)` entries with offsets, and one **delta-varint posting list per term** (ascending row numbers, each list decodable on its own). Queries: single word, AND of words (intersect, shortest first), exact phrase (AND, then verify the symbol sequence in the row heap). Single-character words are not indexed; queries on them scan.
-- **Equality index** (per segment): a string cell is identified by its row-heap offset (identical strings share one), so equality on a string column is a posting list keyed by that offset; fixed-size columns are keyed by the cell value.
-- **Time range, sorting, pagination:** a range filter prunes blocks by min/max and scans the rest; results come in insertion order or sorted by any fixed-size column, one page at a time. Rows are numbered by one global row number per dataframe (Q90): the segment is `row / segment_size` (the segment size is fixed in the manifest).
-- **Word table:** to look a query word up in a sealed folder (which has no dictionary) the folder keeps `words.idx`: the ordinals sorted by word bytes (4 bytes per word, memory-mapped). A binary search over it finds a word's ordinal, and also gives prefix search. It is written when the folder is sealed.
-- **Case-insensitive search** is optional per column (flag): a second word index keyed by `(column, xxh3_64(case-folded word))`, queries folded the same way (full Unicode case folding, `caseless` crate). Off by default.
-- The active (unsealed) segment's index is kept in memory and written when the segment is sealed or the folder is committed; if an index file is missing or covers fewer rows than the segment, it is rebuilt from the row heap.
-- A search returns a lazy iterator of row numbers; a helper hydrates a row by number.
+The viewer needs: word/phrase search, equality filters, a time range, sorting and pagination (Q82). Logs are immutable and only searched, so **indexes are persisted** (Q89) in one index file per segment (`<segment>.idx`) and read through `memmap2` (Q93).
+
+**What a word is.** Search works on the symbol streams, so a *word* is a word the tokenizer stored in the heap (two or more characters) or a single character. **Inline runs (UUIDs, hex, base64 and long random-looking ids) are not words** and never match a word or phrase filter; find them with an equality filter on the whole value. Words and phrases are split with the column's splitter, so a phrase is split the way the text was when it was stored. This definition is the same whether a query is answered from an index or by scanning, so results never depend on which indexes exist.
+
+**Filters** (a `Query` is a list of filters combined with AND):
+- `Word { column, word, case_insensitive }`: the string column contains the word (case-insensitive with full Unicode case folding via the `caseless` crate).
+- `Phrase { column, text }`: the words of `text` appear next to each other, in order. Candidates come from the intersection of the words' posting lists and are then verified against the symbol streams.
+- `Equals { column, value }`: whole-value equality (`Null` matches null cells). Strings are compared by their decoded text; fixed-size columns by their cell value.
+- `Range { column, min, max }`: inclusive bounds on a fixed-size column; blocks are skipped by their stored minimum and maximum; nulls never match.
+
+**Evaluation.** `Frame::search(&Query)` returns a lazy iterator of row numbers in insertion order: it evaluates one segment at a time, then the rows buffered since the last commit. Per segment: filters that have an index give sorted candidate lists, which are intersected (shortest first); filters without a usable index (single-character words, columns without the flag, `Null`) are checked row by row on the remaining candidates by decoding only the needed symbol stream or cell. `count(&Query)` and `search_page(&Query, &Page)` build on it; a page can be sorted by any fixed-size column (nulls last, ties by row number) and cut with `offset` and `limit`, and reports the total number of matches. The buffer of unwritten rows gets an in-memory index of the same format, rebuilt when the buffer has grown.
+
+**Per-column index flags** (in the schema): `index_words` (word index, string columns), `case_insensitive` (an additional index of case-folded words, string columns) and `index_equality` (any column except `Blob`). Only flagged columns are indexed, which keeps the file size under control.
+
+**Index file** (`LSQIDX01`): a table of term indexes, one per (column, kind). Each term index is a sorted directory of `(key, postings offset, count)` entries (20 bytes each) and delta-varint posting lists of ascending row numbers. Keys: the word ordinal (words), the xxh3 hash of the case-folded word (case-insensitive), and the cell value, or the xxh3 hash of the text for strings (equality). A whole-file xxh3 checksum is checked by `Store::verify()`, not on every open. Single-character words are never indexed (they would match nearly every row) and are checked by scanning.
+- **Compression option:** with `StoreOptions::compress_indexes` the index file is stored zstd-compressed (`LSQIDXZ1`, about 2.7 times smaller) and decompressed into memory when opened, instead of being mapped. See 13 for the measured size trade-off.
+- **Word table:** a sealed folder also gets `words.idx`: the ordinals sorted by the words' bytes (4 bytes per word, memory-mapped). It serves `Store::lookup_word` and prefix suggestions (`Store::words_with_prefix`) with binary search; before sealing, suggestions scan the heap.
+- Rows are matched against the symbol streams, so the index of a segment is built once, when the segment is written, from the rows in memory (no re-decoding of the segment).
 
 ### 6.6 Inserting rows
 - `push_row(&self, &[Value])` checks the values against the schema and returns an error on a column-count or type mismatch.
@@ -274,11 +283,13 @@ A store is a **folder** covering one day or other time period. All its dataframe
 | 92 | Harness? | `examples/` with dev-dependencies; corpus tests skip when the corpus is missing; `scratch/` is git-ignored. |
 | 93 | mmap? | `memmap2` feature on by default but used only for index files; blocks use plain reads. |
 | 94 | Review points? | Stop after milestone 1 (with compression numbers) and after milestone 3. |
+| 95 | Search semantics? | Words are heap words or single characters from the symbol streams; inline runs are not words (use equality); index and scan paths give identical results. |
+| 96 | Index compression? | Optional zstd-compressed index files (`compress_indexes`, default off pending a decision); compressed files are read into memory, plain files are memory-mapped. |
 | (note) | Folder = period | A folder covers a day or other period and is shared by all its dataframes; on rotation the dictionary is dropped, the heap and indexes stay. |
 
 ## 9. Open Questions
 - Entropy thresholds (4.5 base64, 4.0 opaque) are guesses; calibrate on the corpus in milestone 1.
-- Index size versus the 30% target: the stored files without indexes are 25.6% of raw on the whole corpus (see 13). Persisted indexes are estimated at 4-6% of raw, which would bring the total to about 30-32%; measure in milestone 4 and consider flagging fewer columns if the target is missed. (An earlier note said 13-16% of raw; that compared the index to the compressed size, not to the raw size.)
+- **Index size versus the 30% target (decision needed):** with every index flag set, plain (memory-mapped) index files make the sample 35.9% of raw; zstd-compressed index files make it 31.1% (whole corpus: 28.7%). `compress_indexes` is off by default because Q93 wanted memory-mapped index reads. Whether to turn it on by default, and/or to index fewer columns (the `data` word index alone is 3.4% of raw), is the user's call; see 13.
 - Thresholds to measure: base64 run length (64), opaque run length (24), segment size (100,000 rows), column block size (4,096 rows), row-heap block size (64 KiB), zstd level, per-entry dictionary cost estimate (32 bytes).
 - MSRV: `caseless` does not declare a minimum Rust version; `rust-version = "1.85"` is not yet verified against it.
 
@@ -356,4 +367,14 @@ These findings drove the symbol encoding (4.3), inline base64/opaque runs (4.2),
 | whole corpus (831,523 rows, 41 columns) | 775.5 MB | 0.73 MB | 9 x 197.7 MB total (largest 36 MB) | 198.4 MB | 25.6% |
 
   Reopening read-only takes 0.01 s; reading all 831,523 rows back from disk and comparing them with the source JSON takes 8.5 s with 0 mismatches. Writing took 102 s, almost all of it zstd level 19. For reference, `zstd -19` on the raw file gives about 22.6%. Indexes (milestone 4) are not included yet; see section 9.
-- Next: milestone 4 (search indexes and filters), then date/time parsing (5), then benchmarks (6).
+- **Milestone 4 done:** `filebytes` (the only `unsafe`, for memory mapping), `index` (index files, `SegmentIndex`, `WordTable`, optional compression), `query` (`Query`, `Filter`, `Page`, `OrderBy`, evaluation over segments and the buffer), tokenizer symbol parsing (`symbols`), and in `store`: index files written at commit and cleaned up with their segments, `Frame::search`/`count`/`search_page`, `Store::lookup_word`, `words_with_prefix`, `verify`, `words.idx` at seal. 80 tests pass and clippy is clean. The main test generates data from known rules and checks 27 queries (words, case-insensitive, single characters, phrases, JSON escapes, equality, null, ranges, combinations) against ground truth computed from the rules, on an indexed and an unindexed dataframe, with the rows in the buffer, in one segment, in segment plus buffer, and after reopening a sealed store with three segments.
+- **Measured on the corpus** (`examples/search_corpus.rs`; every flag set: words on `text` and `data`, case-insensitive on `text`, equality on six columns; zstd level 19):
+
+| Input | Without indexes | Index files | With indexes |
+|---|---|---|---|
+| sample (91,681 rows, 90.5 MB), plain index files | 25.35 MB = 28.0% | 7.02 MB = 7.8% | 32.53 MB = 35.9% |
+| sample, zstd-compressed index files | 25.35 MB = 28.0% | 2.62 MB = 2.9% | 28.13 MB = 31.1% |
+| whole corpus (831,523 rows, 775.5 MB), compressed | 198.39 MB = 25.6% | 23.50 MB = 3.0% | 222.50 MB = 28.7% |
+
+  On the sample the plain index cost splits as: words on `text` 2.0%, words on `data` 3.4% more, the case-insensitive index 1.8% more, equality on six columns 0.5%. (`words.idx` adds 0.17 MB on the sample and 0.61 MB on the corpus, included above.) Query times on the whole corpus, indexed versus a scan of the unindexed twin: word `error` in `text` 0.1 ms vs 733 ms; case-insensitive 0.1 ms vs 1.6 s; word in `data` matching 654,821 rows 3.3 ms vs 1.1 s; `type = assistant` 0.3 ms vs 91 ms; phrase `let me` 75 ms vs 730 ms; type + subtype + word `error` 0.6 ms vs 684 ms; a page of 50 sorted rows out of 77,406 matches 14 ms; prefix suggestions 0.6 ms. A single-character word (`:`) is scanned either way (0.7 s). Indexed and unindexed searches agree on every query.
+- Next: date/time parsing (milestone 5), then benchmarks and tuning (6).

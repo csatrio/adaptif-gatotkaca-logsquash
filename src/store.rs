@@ -15,6 +15,8 @@ use crate::dataframe::{DataFrame, DataFrameOptions};
 use crate::dictionary::{Dictionary, xxh3};
 use crate::error::{Error, Result};
 use crate::heap::{Heap, MemHeap};
+use crate::index::{SegmentIndex, WordTable, build_index, compress_index, write_new_file};
+use crate::query::{self, Page, PageResult, Prepared, Query, RowSource};
 use crate::schema::{Column, ColumnFlags, Schema};
 use crate::segment::{SegmentReader, WriteOptions, write_segment};
 use crate::tokenizer::TokenizerOptions;
@@ -55,6 +57,8 @@ pub struct StoreOptions {
     pub row_heap_block_bytes: usize,
     /// Target size of a heap block in bytes (default 1 MiB).
     pub heap_block_bytes: usize,
+    /// Store the search index files zstd-compressed (about 2.7 times smaller, but read into memory instead of mapped).
+    pub compress_indexes: bool,
 }
 
 impl Default for StoreOptions {
@@ -68,6 +72,7 @@ impl Default for StoreOptions {
             block_rows: 4096,
             row_heap_block_bytes: 64 * 1024,
             heap_block_bytes: 1 << 20,
+            compress_indexes: false,
         }
     }
 }
@@ -287,6 +292,7 @@ struct Segment {
     rows: u64,
     start: u64,
     reader: SegmentReader,
+    index: Option<SegmentIndex>,
 }
 
 struct FrameState {
@@ -294,6 +300,8 @@ struct FrameState {
     segments: Vec<Segment>,
     committed_rows: u64,
     next_segment: u32,
+    /// Index of the buffered rows, valid while the buffer has this many rows.
+    active_index: Mutex<Option<(u64, Arc<SegmentIndex>)>>,
 }
 
 /// One dataframe of a store: committed segments on disk plus the rows buffered since the last commit.
@@ -381,9 +389,170 @@ impl Frame {
         }
     }
 
+    /// The row numbers that match `query`, in insertion order, evaluated one segment at a time. Rows buffered since the
+    /// last commit are included. A commit while the iterator is being consumed can make it skip or repeat rows.
+    pub fn search(&self, query: &Query) -> Result<RowIds<'_>> {
+        let prepared = query::prepare(query, &self.schema, &self.words.read().expect("word store lock poisoned"))?;
+        Ok(RowIds { frame: self, prepared, unit: 0, pending: Vec::new().into_iter(), done: false })
+    }
+
+    /// The number of rows that match `query`.
+    pub fn count(&self, query: &Query) -> Result<u64> {
+        let mut n = 0;
+        for row in self.search(query)? {
+            row?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// One page of the rows that match `query`, optionally sorted by a fixed-size column (nulls last).
+    pub fn search_page(&self, query: &Query, page: &Page) -> Result<PageResult> {
+        let mut rows: Vec<u64> = self.search(query)?.collect::<Result<_>>()?;
+        let total = rows.len() as u64;
+        if let Some(order) = page.order_by {
+            let column = self.schema.columns().get(order.column).ok_or(Error::ColumnOutOfRange)?;
+            if column.ty.is_variable() {
+                return Err(Error::TypeMismatch { column: column.name.clone() });
+            }
+            let mut keyed: Vec<(Option<u64>, u64)> = Vec::with_capacity(rows.len());
+            for &row in &rows {
+                keyed.push((self.sort_key(row, order.column)?, row));
+            }
+            keyed.sort_by(|a, b| match (a.0, b.0) {
+                (Some(x), Some(y)) => (if order.descending { y.cmp(&x) } else { x.cmp(&y) }).then(a.1.cmp(&b.1)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.1.cmp(&b.1),
+            });
+            rows = keyed.into_iter().map(|(_, row)| row).collect();
+        }
+        Ok(PageResult { total, rows: rows.into_iter().skip(page.offset).take(page.limit).collect() })
+    }
+
+    fn sort_key(&self, row: u64, column: usize) -> Result<Option<u64>> {
+        let state = self.state.read().expect("frame lock poisoned");
+        let (cell, null) = match locate(&state, row) {
+            Some((segment, local)) => state.segments[segment].reader.cell(local, column)?,
+            None => state.active.source_cell(row.checked_sub(state.committed_rows).ok_or(Error::RowOutOfRange)?, column)?,
+        };
+        Ok((!null).then_some(cell))
+    }
+
+    /// The matches of `prepared` in one unit: segments in order, then the buffer. `None` after the last unit.
+    fn search_unit(&self, prepared: &[Prepared], unit: usize) -> Result<Option<Vec<u64>>> {
+        let state = self.state.read().expect("frame lock poisoned");
+        let words = self.words.read().expect("word store lock poisoned");
+        let (base, rows) = if let Some(segment) = state.segments.get(unit) {
+            (segment.start, query::evaluate(&segment.reader, segment.index.as_ref(), &words, prepared)?)
+        } else if unit == state.segments.len() {
+            if state.active.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let index = self.active_index(&state, &words)?;
+            (state.committed_rows, query::evaluate(&BufferSource(&state.active), index.as_deref(), &words, prepared)?)
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(rows.into_iter().map(|r| base + u64::from(r)).collect()))
+    }
+
+    /// The index of the buffered rows, rebuilt when the buffer has grown since it was built.
+    fn active_index(&self, state: &FrameState, words: &WordStore) -> Result<Option<Arc<SegmentIndex>>> {
+        let flags = |c: &Column| c.flags.index_words || c.flags.case_insensitive || c.flags.index_equality;
+        if !self.schema.columns().iter().any(flags) {
+            return Ok(None);
+        }
+        let rows = state.active.len();
+        let mut cache = state.active_index.lock().expect("index cache lock poisoned");
+        if let Some((cached_rows, index)) = &*cache {
+            if *cached_rows == rows {
+                return Ok(Some(Arc::clone(index)));
+            }
+        }
+        let bytes = state.active.with_inner(|inner| build_index(inner, &self.schema, words))?;
+        let index = Arc::new(SegmentIndex::from_vec(bytes)?);
+        *cache = Some((rows, Arc::clone(&index)));
+        Ok(Some(index))
+    }
+
     /// An iterator over all rows in insertion order.
     pub fn rows(&self) -> FrameRows<'_> {
         FrameRows { frame: self, next: 0 }
+    }
+}
+
+/// Lazy iterator over the row numbers that match a query; see [`Frame::search`].
+pub struct RowIds<'a> {
+    frame: &'a Frame,
+    prepared: Vec<Prepared>,
+    unit: usize,
+    pending: std::vec::IntoIter<u64>,
+    done: bool,
+}
+
+impl Iterator for RowIds<'_> {
+    type Item = Result<u64>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row) = self.pending.next() {
+                return Some(Ok(row));
+            }
+            if self.done {
+                return None;
+            }
+            match self.frame.search_unit(&self.prepared, self.unit) {
+                Ok(Some(rows)) => {
+                    self.unit += 1;
+                    self.pending = rows.into_iter();
+                }
+                Ok(None) => self.done = true,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
+/// The rows buffered in a dataframe, as a query source.
+struct BufferSource<'a>(&'a DataFrame<MemHeap>);
+
+impl RowSource for BufferSource<'_> {
+    fn row_count(&self) -> u64 {
+        self.0.len()
+    }
+
+    fn cell(&self, row: u64, column: usize) -> Result<(u64, bool)> {
+        self.0.source_cell(row, column)
+    }
+
+    fn with_entry(&self, cell: u64, f: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.0.source_entry(cell, f)
+    }
+
+    fn range(&self, column: usize, lo: u64, hi: u64) -> Result<Vec<u32>> {
+        self.0.source_range(column, lo, hi)
+    }
+}
+
+impl RowSource for SegmentReader {
+    fn row_count(&self) -> u64 {
+        self.rows()
+    }
+
+    fn cell(&self, row: u64, column: usize) -> Result<(u64, bool)> {
+        SegmentReader::cell(self, row, column)
+    }
+
+    fn with_entry(&self, cell: u64, f: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        SegmentReader::with_entry(self, cell, f)
+    }
+
+    fn range(&self, column: usize, lo: u64, hi: u64) -> Result<Vec<u32>> {
+        SegmentReader::range(self, column, lo, hi)
     }
 }
 
@@ -431,6 +600,8 @@ pub struct Store {
     writable: Arc<AtomicBool>,
     committed: Mutex<Committed>,
     frames: RwLock<Vec<Arc<Frame>>>,
+    /// The sorted word table, present once the store has been sealed.
+    word_table: RwLock<Option<WordTable>>,
     /// Held for as long as the store is open for writing.
     _lock: Option<File>,
 }
@@ -465,6 +636,7 @@ impl Store {
             writable: Arc::new(AtomicBool::new(true)),
             committed: Mutex::new(committed),
             frames: RwLock::new(Vec::new()),
+            word_table: RwLock::new(None),
             _lock: Some(lock),
         })
     }
@@ -488,10 +660,15 @@ impl Store {
             return Err(Error::ReadOnly);
         }
         if writable {
-            let known: Vec<&str> = manifest.frames.iter().flat_map(|f| f.segments.iter().map(|s| s.file.as_str())).collect();
+            let known: Vec<String> = manifest
+                .frames
+                .iter()
+                .flat_map(|f| f.segments.iter().flat_map(|s| [s.file.clone(), s.file.replace(".seg", ".idx")]))
+                .collect();
             for entry in std::fs::read_dir(dir)?.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name == "manifest.tmp" || (name.ends_with(".seg") && !known.contains(&name.as_str())) {
+                let stray = (name.ends_with(".seg") || (name.ends_with(".idx") && name != "words.idx")) && !known.contains(&name);
+                if name == "manifest.tmp" || stray {
                     std::fs::remove_file(entry.path())?;
                 }
             }
@@ -514,7 +691,9 @@ impl Store {
                 if reader.rows() != segment.rows {
                     return Err(Error::Corrupt("segment row count differs from the manifest"));
                 }
-                segments.push(Segment { file: segment.file.clone(), rows: segment.rows, start, reader });
+                let index_path = dir.join(segment.file.replace(".seg", ".idx"));
+                let index = if index_path.exists() { Some(SegmentIndex::open(&index_path)?) } else { None };
+                segments.push(Segment { file: segment.file.clone(), rows: segment.rows, start, reader, index });
                 start += segment.rows;
             }
             let state = FrameState {
@@ -522,6 +701,7 @@ impl Store {
                 segments,
                 committed_rows: start,
                 next_segment: meta.next_segment,
+                active_index: Mutex::new(None),
             };
             frames.push(Arc::new(Frame {
                 id,
@@ -533,6 +713,8 @@ impl Store {
             }));
         }
         let committed = Committed { heap_bytes: manifest.heap_bytes, heap_words: manifest.heap_words, sealed: manifest.sealed };
+        let table_path = dir.join("words.idx");
+        let word_table = if manifest.sealed && table_path.exists() { Some(WordTable::open(&table_path)?) } else { None };
         Ok(Self {
             dir: dir.to_path_buf(),
             options,
@@ -540,6 +722,7 @@ impl Store {
             writable: flag,
             committed: Mutex::new(committed),
             frames: RwLock::new(frames),
+            word_table: RwLock::new(word_table),
             _lock: lock,
         })
     }
@@ -573,6 +756,7 @@ impl Store {
             segments: Vec::new(),
             committed_rows: 0,
             next_segment: 0,
+            active_index: Mutex::new(None),
         };
         let frame = Arc::new(Frame {
             id: frames.len(),
@@ -654,10 +838,20 @@ impl Store {
                 continue;
             }
             let file = format!("f{}-{:06}.seg", frame.id, guard.next_segment);
-            let result = guard.active.with_inner(|inner| write_segment(&self.dir.join(&file), inner, write_options));
+            let result = guard.active.with_inner(|inner| {
+                write_segment(&self.dir.join(&file), inner, write_options)?;
+                let words = self.words.read().expect("word store lock poisoned");
+                let mut index = build_index(inner, &frame.schema, &words)?;
+                if self.options.compress_indexes {
+                    index = compress_index(&index, self.options.zstd_level)?;
+                }
+                write_new_file(&self.dir.join(file.replace(".seg", ".idx")), &index)
+            });
             match result {
                 Ok(()) => written.push((i, file, guard.active.len())),
                 Err(e) => {
+                    let _ = std::fs::remove_file(self.dir.join(&file));
+                    let _ = std::fs::remove_file(self.dir.join(file.replace(".seg", ".idx")));
                     failure = Some(e);
                     break;
                 }
@@ -693,6 +887,7 @@ impl Store {
         if let Err(e) = outcome {
             for (_, file, _) in &written {
                 let _ = std::fs::remove_file(self.dir.join(file));
+                let _ = std::fs::remove_file(self.dir.join(file.replace(".seg", ".idx")));
             }
             return Err(e);
         }
@@ -702,14 +897,62 @@ impl Store {
             let guard = &mut guards[i];
             let reader = SegmentReader::open(&self.dir.join(&file), frames[i].schema.len())?;
             let start = guard.committed_rows;
-            guard.segments.push(Segment { file, rows, start, reader });
+            let index = SegmentIndex::open(&self.dir.join(file.replace(".seg", ".idx")))?;
+            guard.segments.push(Segment { file, rows, start, reader, index: Some(index) });
             guard.committed_rows += rows;
             guard.next_segment += 1;
             guard.active.clear();
+            *guard.active_index.lock().expect("index cache lock poisoned") = None;
         }
         *committed = Committed { heap_bytes, heap_words, sealed: manifest.sealed };
         if seal {
+            let path = self.dir.join("words.idx");
+            let _ = std::fs::remove_file(&path);
+            WordTable::write(&path, &self.words.read().expect("word store lock poisoned"))?;
+            *self.word_table.write().expect("word table lock poisoned") = Some(WordTable::open(&path)?);
             self.writable.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// The ordinal of a word in the shared heap.
+    pub fn lookup_word(&self, word: &str) -> Option<u32> {
+        let words = self.words.read().expect("word store lock poisoned");
+        match &*self.word_table.read().expect("word table lock poisoned") {
+            Some(table) => table.lookup(&words, word),
+            None => words.lookup(word),
+        }
+    }
+
+    /// Up to `limit` words that start with `prefix`, in byte order (for suggestions). A sealed store answers from its
+    /// memory-mapped word table; otherwise the heap is scanned.
+    pub fn words_with_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
+        let words = self.words.read().expect("word store lock poisoned");
+        if let Some(table) = &*self.word_table.read().expect("word table lock poisoned") {
+            return table.prefix(&words, prefix, limit);
+        }
+        let mut found: Vec<String> =
+            (0..words.word_count()).filter_map(|o| words.get(o)).filter(|w| w.starts_with(prefix)).map(str::to_owned).collect();
+        found.sort();
+        found.truncate(limit);
+        found
+    }
+
+    /// Checks every stored checksum (all blocks of the heap, the segment indexes and the word table). Reads every file.
+    pub fn verify(&self) -> Result<()> {
+        let manifest = read_manifest(&self.dir)?;
+        read_heap(&self.dir.join("heap.bin"), manifest.heap_bytes, manifest.heap_words)?;
+        for frame in self.frames.read().expect("frame list lock poisoned").iter() {
+            let state = frame.state.read().expect("frame lock poisoned");
+            for segment in &state.segments {
+                segment.reader.verify()?;
+                if let Some(index) = &segment.index {
+                    index.verify()?;
+                }
+            }
+        }
+        if let Some(table) = &*self.word_table.read().expect("word table lock poisoned") {
+            table.verify()?;
         }
         Ok(())
     }
@@ -720,7 +963,7 @@ impl Store {
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name == "manifest" || name == "heap.bin" || name.ends_with(".seg") {
+            if name == "manifest" || name == "heap.bin" || name.ends_with(".seg") || name.ends_with(".idx") {
                 total += entry.metadata()?.len();
             }
         }
@@ -1026,6 +1269,294 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), 400);
+    }
+
+    // ---- search ----------------------------------------------------------------------------------------------------
+
+    use crate::query::{OrderBy, Page};
+    use crate::splitter::{DefaultSplitter, JsonEscapeSplitter, Splitter, split_words};
+
+    fn search_schema(indexed: bool) -> Schema {
+        let flag = |c: Column, on: bool, f: fn(Column) -> Column| if on { f(c) } else { c };
+        Schema::new(vec![
+            flag(Column::new("id", ColumnType::I64), indexed, Column::index_equality),
+            flag(Column::new("level", ColumnType::String), indexed, Column::index_equality),
+            flag(flag(Column::new("msg", ColumnType::String), indexed, Column::index_words), indexed, Column::case_insensitive),
+            flag(Column::new("data", ColumnType::String).json_escapes(), indexed, Column::index_words),
+            flag(Column::new("n", ColumnType::I64), indexed, Column::index_equality),
+        ])
+        .unwrap()
+    }
+
+    const LEVELS: [&str; 3] = ["INFO", "WARN", "ERROR"];
+    const TAILS: [&str; 4] = ["ok", "failed: timeout", "retry later", "Done."];
+
+    fn texts(i: u64) -> (String, String, String) {
+        let level = LEVELS[(i % 3) as usize];
+        let msg = format!("{level} request {} for user{} took {}ms {}", i % 13, i % 7, i % 50, TAILS[(i % 4) as usize]);
+        let data = format!(r#"{{"k":{i},"text":"line a\nline b {}"}}"#, i % 5);
+        (level.to_owned(), msg, data)
+    }
+
+    fn push_search_row(frame: &Frame, i: u64) {
+        let (level, msg, data) = texts(i);
+        let n = if i % 10 == 0 { Value::Null } else { Value::I64(((i * 7) % 100) as i64) };
+        frame.push_row(&[Value::I64(i as i64), Value::Str(&level), Value::Str(&msg), Value::Str(&data), n]).unwrap();
+    }
+
+    fn has_word(text: &str, word: &str, ci: bool, splitter: &dyn Splitter) -> bool {
+        let fold = |s: &str| caseless::default_case_fold_str(s);
+        split_words(splitter, text).iter().any(|w| if ci { fold(w) == fold(word) } else { *w == word })
+    }
+
+    fn has_phrase(text: &str, phrase: &str, splitter: &dyn Splitter) -> bool {
+        let (hay, needle) = (split_words(splitter, text), split_words(splitter, phrase));
+        hay.windows(needle.len()).any(|w| w == needle.as_slice())
+    }
+
+    /// The queries to try and the ids each must return (computed from the generating rules, not from any index).
+    fn cases(rows: u64) -> Vec<(String, Query, Vec<u64>)> {
+        let truth = |pred: &dyn Fn(u64) -> bool| (0..rows).filter(|&i| pred(i)).collect::<Vec<_>>();
+        let msg = |i: u64| texts(i).1;
+        let data = |i: u64| texts(i).2;
+        let n = |i: u64| if i % 10 == 0 { None } else { Some(((i * 7) % 100) as i64) };
+        let d = &DefaultSplitter as &dyn Splitter;
+        let j = &JsonEscapeSplitter as &dyn Splitter;
+        vec![
+            ("word request".into(), Query::new().word(2, "request"), truth(&|_| true)),
+            ("word timeout".into(), Query::new().word(2, "timeout"), truth(&|i| i % 4 == 1)),
+            ("word user3".into(), Query::new().word(2, "user3"), truth(&|i| i % 7 == 3)),
+            ("word missing".into(), Query::new().word(2, "nonexistent"), vec![]),
+            ("word ci ERROR".into(), Query::new().word_ci(2, "ERROR"), truth(&|i| has_word(&msg(i), "error", true, d))),
+            ("word ci error".into(), Query::new().word_ci(2, "error"), truth(&|i| i % 3 == 2)),
+            ("word cs error".into(), Query::new().word(2, "error"), vec![]),
+            ("word ci missing".into(), Query::new().word_ci(2, "NONEXISTENT"), vec![]),
+            ("single char colon".into(), Query::new().word(2, ":"), truth(&|i| has_word(&msg(i), ":", false, d))),
+            ("single char dot".into(), Query::new().word(2, "."), truth(&|i| i % 4 == 3)),
+            ("single char absent".into(), Query::new().word(2, "x"), vec![]),
+            ("phrase failed: timeout".into(), Query::new().phrase(2, "failed: timeout"), truth(&|i| i % 4 == 1)),
+            ("phrase request 3 for".into(), Query::new().phrase(2, "request 3 for"), truth(&|i| has_phrase(&msg(i), "request 3 for", d))),
+            ("phrase wrong order".into(), Query::new().phrase(2, "for request"), vec![]),
+            (
+                "phrase json escape".into(),
+                Query::new().phrase(3, "line a\\nline b 2"),
+                truth(&|i| has_phrase(&data(i), "line a\\nline b 2", j)),
+            ),
+            ("json word".into(), Query::new().word(3, "text"), truth(&|_| true)),
+            ("equals level".into(), Query::new().equals(1, Value::Str("WARN")), truth(&|i| i % 3 == 1)),
+            ("equals level missing".into(), Query::new().equals(1, Value::Str("nope")), vec![]),
+            ("equals id".into(), Query::new().equals(0, Value::I64(42)), truth(&|i| i == 42)),
+            ("equals null".into(), Query::new().equals(4, Value::Null), truth(&|i| i % 10 == 0)),
+            ("equals n".into(), Query::new().equals(4, Value::I64(49)), truth(&|i| n(i) == Some(49))),
+            ("range id".into(), Query::new().range(0, Some(Value::I64(10)), Some(Value::I64(19))), truth(&|i| (10..=19).contains(&i))),
+            ("range open".into(), Query::new().range(4, Some(Value::I64(90)), None), truth(&|i| n(i).is_some_and(|v| v >= 90))),
+            ("range empty".into(), Query::new().range(0, Some(Value::I64(500)), None), vec![]),
+            ("all rows".into(), Query::new(), truth(&|_| true)),
+            (
+                "combo".into(),
+                Query::new().word(2, "timeout").equals(1, Value::Str("WARN")).range(0, Some(Value::I64(20)), Some(Value::I64(80))),
+                truth(&|i| i % 4 == 1 && i % 3 == 1 && (20..=80).contains(&i)),
+            ),
+            (
+                "combo words".into(),
+                Query::new().word(2, "request").word_ci(2, "WARN").phrase(2, "took 3"),
+                truth(&|i| has_word(&msg(i), "warn", true, d) && has_phrase(&msg(i), "took 3", d)),
+            ),
+        ]
+    }
+
+    fn check_search(frame: &Frame, label: &str) {
+        let rows = frame.len();
+        for (name, query, expected) in cases(rows) {
+            let got: Vec<u64> = frame.search(&query).unwrap().map(|r| r.unwrap()).collect();
+            assert_eq!(got, expected, "{label}: {name}");
+            assert_eq!(frame.count(&query).unwrap(), expected.len() as u64, "{label}: {name} (count)");
+        }
+    }
+
+    #[test]
+    fn search_matches_the_ground_truth_in_every_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        let (indexed, plain) =
+            (store.create_frame("indexed", search_schema(true)).unwrap(), store.create_frame("plain", search_schema(false)).unwrap());
+        let push = |range: std::ops::Range<u64>| {
+            for i in range {
+                push_search_row(&indexed, i);
+                push_search_row(&plain, i);
+            }
+        };
+        push(0..60); // everything still in the buffer
+        check_search(&indexed, "indexed, buffer");
+        check_search(&plain, "plain, buffer");
+        store.commit().unwrap();
+        check_search(&indexed, "indexed, segment");
+        check_search(&plain, "plain, segment");
+        push(60..100); // a segment plus a buffer
+        check_search(&indexed, "indexed, segment+buffer");
+        check_search(&plain, "plain, segment+buffer");
+        store.commit().unwrap();
+        push(100..130);
+        store.commit().unwrap();
+        store.seal().unwrap();
+        drop(store);
+        let store = Store::open_read_only(dir.path(), options()).unwrap();
+        check_search(&store.frame("indexed").unwrap(), "indexed, reopened, 3 segments");
+        check_search(&store.frame("plain").unwrap(), "plain, reopened");
+        store.verify().unwrap();
+        assert!(dir.path().join("f0-000000.idx").exists() && dir.path().join("words.idx").exists());
+    }
+
+    #[test]
+    fn the_buffer_index_is_refreshed_after_inserts_and_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        let frame = store.create_frame("indexed", search_schema(true)).unwrap();
+        let q = Query::new().word(2, "request");
+        for i in 0..10 {
+            push_search_row(&frame, i);
+        }
+        assert_eq!(frame.count(&q).unwrap(), 10);
+        for i in 10..15 {
+            push_search_row(&frame, i);
+        }
+        assert_eq!(frame.count(&q).unwrap(), 15);
+        store.commit().unwrap();
+        for i in 15..25 {
+            push_search_row(&frame, i); // same buffer size as before the first commit's cached index
+        }
+        assert_eq!(frame.count(&q).unwrap(), 25);
+        assert_eq!(frame.count(&Query::new().equals(0, Value::I64(24))).unwrap(), 1);
+    }
+
+    #[test]
+    fn sorting_and_pagination() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        let frame = store.create_frame("indexed", search_schema(true)).unwrap();
+        for i in 0..40 {
+            push_search_row(&frame, i);
+        }
+        store.commit().unwrap();
+        for i in 40..50 {
+            push_search_row(&frame, i);
+        }
+        let all = Query::new();
+        let by_n = |descending| Some(OrderBy { column: 4, descending });
+        let page = |order_by, offset, limit| frame.search_page(&all, &Page { order_by, offset, limit }).unwrap();
+        let plain = page(None, 5, 3);
+        assert_eq!((plain.total, plain.rows), (50, vec![5, 6, 7]));
+        let key = |row: u64| if row % 10 == 0 { None } else { Some(((row * 7) % 100) as i64) };
+        let mut expected: Vec<u64> = (0..50).collect();
+        expected.sort_by_key(|&r| (key(r).is_none(), key(r), r)); // nulls last, ties by row number
+        assert_eq!(page(by_n(false), 0, 50).rows, expected);
+        let mut descending: Vec<u64> = (0..50).filter(|&r| key(r).is_some()).collect();
+        descending.sort_by_key(|&r| (std::cmp::Reverse(key(r)), r));
+        let result = page(by_n(true), 0, 50).rows;
+        assert_eq!(result[..descending.len()], descending[..]);
+        assert!(result[descending.len()..].iter().all(|&r| r % 10 == 0));
+        assert_eq!(page(by_n(false), 45, 10).rows, expected[45..]);
+        let filtered = frame.search_page(&Query::new().word(2, "timeout"), &Page { order_by: by_n(true), offset: 0, limit: 2 }).unwrap();
+        assert_eq!((filtered.total, filtered.rows.len()), (13, 2));
+        let text_order = Page { order_by: Some(OrderBy { column: 1, descending: false }), offset: 0, limit: 1 };
+        assert!(matches!(frame.search_page(&all, &text_order), Err(Error::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn invalid_queries_are_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        let frame = store.create_frame("f", search_schema(true)).unwrap();
+        push_search_row(&frame, 1);
+        assert!(matches!(frame.search(&Query::new().word(2, "")), Err(Error::InvalidQuery(_))));
+        assert!(matches!(frame.search(&Query::new().phrase(2, "")), Err(Error::InvalidQuery(_))));
+        assert!(matches!(frame.search(&Query::new().word(0, "x")), Err(Error::TypeMismatch { .. })));
+        assert!(matches!(frame.search(&Query::new().word(9, "x")), Err(Error::ColumnOutOfRange)));
+        assert!(matches!(frame.search(&Query::new().range(1, None, None)), Err(Error::TypeMismatch { .. })));
+        assert!(matches!(frame.search(&Query::new().equals(0, Value::Str("x"))), Err(Error::TypeMismatch { .. })));
+        assert!(matches!(
+            frame.search(&Query::new().equals(0, Value::I64(1)).range(0, Some(Value::Str("a")), None)),
+            Err(Error::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn inline_runs_are_not_words_but_are_found_by_equality() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        let schema = Schema::new(vec![
+            Column::new("id", ColumnType::String).index_equality(),
+            Column::new("text", ColumnType::String).index_words(),
+        ])
+        .unwrap();
+        let frame = store.create_frame("f", schema).unwrap();
+        let uuid = "28cb7d12-4175-485f-8b91-02be9c532039";
+        let tool = "toolu_01UAgYH3kvbEkEaocV5KPN7N";
+        frame.push_row(&[Value::Str(uuid), Value::Str(&format!("session {uuid} used {tool}"))]).unwrap();
+        frame.push_row(&[Value::Str(tool), Value::Str("session none")]).unwrap();
+        store.commit().unwrap();
+        assert_eq!(frame.count(&Query::new().word(1, "session")).unwrap(), 2);
+        assert_eq!(frame.count(&Query::new().word(1, "28cb7d12")).unwrap(), 0); // part of an inline UUID
+        assert_eq!(frame.count(&Query::new().word(1, "01UAgYH3kvbEkEaocV5KPN7N")).unwrap(), 0); // inline opaque run
+        assert_eq!(frame.count(&Query::new().equals(0, Value::Str(uuid))).unwrap(), 1);
+        assert_eq!(frame.count(&Query::new().equals(0, Value::Str(tool))).unwrap(), 1);
+    }
+
+    #[test]
+    fn word_table_gives_prefix_suggestions_before_and_after_sealing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        let frame = store.create_frame("f", search_schema(true)).unwrap();
+        for i in 0..30 {
+            push_search_row(&frame, i);
+        }
+        let before = store.words_with_prefix("us", 100);
+        assert_eq!(before, ["user0", "user1", "user2", "user3", "user4", "user5", "user6"]);
+        assert!(store.lookup_word("timeout").is_some());
+        store.seal().unwrap();
+        assert_eq!(store.words_with_prefix("us", 3), ["user0", "user1", "user2"]);
+        drop(store);
+        let reopened = Store::open_read_only(dir.path(), options()).unwrap();
+        assert_eq!(reopened.words_with_prefix("us", 100), before);
+        assert!(reopened.words_with_prefix("zzz", 5).is_empty());
+    }
+
+    #[test]
+    fn verify_detects_a_damaged_index() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::create(dir.path(), options()).unwrap();
+            let frame = store.create_frame("f", search_schema(true)).unwrap();
+            for i in 0..30 {
+                push_search_row(&frame, i);
+            }
+            store.seal().unwrap();
+        }
+        let path = dir.path().join("f0-000000.idx");
+        let good = std::fs::read(&path).unwrap();
+        Store::open_read_only(dir.path(), options()).unwrap().verify().unwrap();
+        let mut bad = good.clone();
+        let at = bad.len() - 30;
+        bad[at] ^= 0x01;
+        std::fs::write(&path, &bad).unwrap();
+        assert!(Store::open_read_only(dir.path(), options()).unwrap().verify().is_err());
+        std::fs::write(&path, &good).unwrap();
+        Store::open_read_only(dir.path(), options()).unwrap().verify().unwrap();
+    }
+
+    #[test]
+    fn index_files_of_an_interrupted_commit_are_cleaned_up() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = Store::create(dir.path(), options()).unwrap();
+            let frame = store.create_frame("f", search_schema(true)).unwrap();
+            push_search_row(&frame, 1);
+            store.commit().unwrap();
+        }
+        std::fs::write(dir.path().join("f0-000077.idx"), b"stray").unwrap();
+        let store = Store::open(dir.path(), options()).unwrap();
+        assert!(!dir.path().join("f0-000077.idx").exists() && dir.path().join("f0-000000.idx").exists());
+        assert_eq!(store.frame("f").unwrap().count(&Query::new().word(2, "request")).unwrap(), 1);
     }
 
     #[test]

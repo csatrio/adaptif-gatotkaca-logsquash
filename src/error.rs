@@ -46,6 +46,8 @@ pub enum Error {
     FrameExists,
     /// The files were written by a newer, incompatible version.
     UnsupportedVersion,
+    /// A query is not valid (for example an empty word).
+    InvalidQuery(&'static str),
 }
 
 /// Result alias using [`Error`].
@@ -69,6 +71,7 @@ impl fmt::Display for Error {
             Error::UnknownFrame => write!(f, "no such dataframe"),
             Error::FrameExists => write!(f, "a dataframe with that name exists already"),
             Error::UnsupportedVersion => write!(f, "unsupported format version"),
+            Error::InvalidQuery(what) => write!(f, "invalid query: {what}"),
         }
     }
 }
