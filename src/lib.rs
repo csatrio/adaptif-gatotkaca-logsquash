@@ -1,8 +1,11 @@
-//! Log squasher: stores logs in compact binary dataframes, compressed by word-level string
-//! deduplication, compact varint symbols and block compression. See `DESIGN.md`.
+//! Log squasher: stores logs in compact binary dataframes, compressed by word-level string deduplication, compact varint
+//! symbols and zstd blocks, with optional persisted indexes for word, phrase, equality and range search.
 //!
-//! The string layer is the [`splitter`], the shared [`words`] store (heap + dictionary) and the [`tokenizer`] that turns
-//! text into symbol streams. On top of it, a [`DataFrame`] stores typed rows (in memory for now).
+//! Start with a [`Store`] (a folder for one day or period), create a frame with a [`Schema`], `push_row` values, `commit`
+//! and `seal`; later open the folder with [`Store::open_read_only`] and search with a [`Query`]. The lower layers are the
+//! [`splitter`], the shared [`words`] store (heap and dictionary) and the [`tokenizer`] that turns text into symbols; an
+//! in-memory [`DataFrame`] sits beneath the on-disk [`Frame`]. See the README for a complete example and `DESIGN.md` for
+//! the design.
 
 #![deny(unsafe_code)]
 #![allow(clippy::module_name_repetitions)]
