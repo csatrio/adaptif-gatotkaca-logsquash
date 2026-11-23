@@ -262,21 +262,8 @@ impl<H: Heap> DataFrame<H> {
         Ok((data.cells[row as usize], data.nulls.get(row as usize)))
     }
 
-    /// Calls `f` with the row-heap bytes starting at the entry of a string cell (`cell` is the cell value, offset + 1).
-    pub(crate) fn source_entry(&self, cell: u64, f: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
-        let inner = self.inner.read().expect("dataframe lock poisoned");
-        let tail = inner.row_heap.get((cell - 1) as usize..).ok_or(Error::Corrupt("row heap offset"))?;
-        f(tail)
-    }
-
-    /// Rows whose non-null cell in `column` lies in `lo..=hi`.
-    pub(crate) fn source_range(&self, column: usize, lo: u64, hi: u64) -> Result<Vec<u32>> {
-        let inner = self.inner.read().expect("dataframe lock poisoned");
-        let data = inner.columns.get(column).ok_or(Error::ColumnOutOfRange)?;
-        Ok((0..inner.rows as usize).filter(|&r| !data.nulls.get(r) && (lo..=hi).contains(&data.cells[r])).map(|r| r as u32).collect())
-    }
-
-    /// Runs `f` on the buffered rows (used when writing a segment).
+    /// Runs `f` on the buffered rows under the buffer lock (writing a segment, a query or an index over the buffer). Take
+    /// it before the word store: see `query::BufferSource`.
     pub(crate) fn with_inner<R>(&self, f: impl FnOnce(&Inner) -> R) -> R {
         f(&self.inner.read().expect("dataframe lock poisoned"))
     }

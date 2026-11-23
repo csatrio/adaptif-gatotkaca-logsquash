@@ -6,10 +6,9 @@
 //! the column's splitter, so a phrase is split into words the same way the text was when it was stored.
 
 use crate::cell;
-use crate::dataframe::DataFrame;
+use crate::dataframe::Inner;
 use crate::dictionary::xxh3;
 use crate::error::{Error, Result};
-use crate::heap::MemHeap;
 use crate::index::{KIND_EQUAL, KIND_FOLD, KIND_WORD, SegmentIndex, fold_hash};
 use crate::schema::Schema;
 use crate::splitter::{DefaultSplitter, JsonEscapeSplitter, Splitter, split_words};
@@ -137,24 +136,40 @@ pub(crate) trait RowSource {
     fn range(&self, column: usize, lo: u64, hi: u64) -> Result<Vec<u32>>;
 }
 
-/// The rows buffered in a dataframe, as a query (and index) source.
-pub(crate) struct BufferSource<'a>(pub(crate) &'a DataFrame<MemHeap>);
+/// The rows buffered in a dataframe, as a query (and index) source, over a buffer lock the caller already holds.
+///
+/// Lock order: the caller takes the buffer lock (`DataFrame::with_inner`) **before** the word store, as `push_row` does
+/// (buffer, then words). A source that locked the buffer per cell while the caller held the words would invert that
+/// order and deadlock against a concurrent `push_row` (and read-lock the buffer recursively).
+pub(crate) struct BufferSource<'a>(pub(crate) &'a Inner);
+
+impl BufferSource<'_> {
+    fn column(&self, column: usize) -> Result<&crate::dataframe::ColumnData> {
+        self.0.columns.get(column).ok_or(Error::ColumnOutOfRange)
+    }
+}
 
 impl RowSource for BufferSource<'_> {
     fn row_count(&self) -> u64 {
-        self.0.len()
+        self.0.rows
     }
 
     fn cell(&self, row: u64, column: usize) -> Result<(u64, bool)> {
-        self.0.source_cell(row, column)
+        let data = self.column(column)?;
+        if row >= self.0.rows {
+            return Err(Error::RowOutOfRange);
+        }
+        Ok((data.cells[row as usize], data.nulls.get(row as usize)))
     }
 
     fn with_entry(&self, cell: u64, f: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
-        self.0.source_entry(cell, f)
+        let tail = self.0.row_heap.get((cell - 1) as usize..).ok_or(Error::Corrupt("row heap offset"))?;
+        f(tail)
     }
 
     fn range(&self, column: usize, lo: u64, hi: u64) -> Result<Vec<u32>> {
-        self.0.source_range(column, lo, hi)
+        let data = self.column(column)?;
+        Ok((0..self.0.rows as usize).filter(|&r| !data.nulls.get(r) && (lo..=hi).contains(&data.cells[r])).map(|r| r as u32).collect())
     }
 }
 

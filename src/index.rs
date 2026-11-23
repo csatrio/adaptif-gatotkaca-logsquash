@@ -415,7 +415,7 @@ mod tests {
 
     fn built(frame: &DataFrame, shared: &SharedWords) -> SegmentIndex {
         let words = shared.read().unwrap();
-        SegmentIndex::from_vec(build_index(&BufferSource(frame), frame.schema(), &words).unwrap()).unwrap()
+        SegmentIndex::from_vec(frame.with_inner(|i| build_index(&BufferSource(i), frame.schema(), &words)).unwrap()).unwrap()
     }
 
     #[test]
@@ -446,7 +446,7 @@ mod tests {
         let shared = shared();
         let frame = frame(&shared);
         let words = shared.read().unwrap();
-        let bytes = build_index(&BufferSource(&frame), frame.schema(), &words).unwrap();
+        let bytes = frame.with_inner(|i| build_index(&BufferSource(i), frame.schema(), &words)).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.idx");
         write_new_file(&path, &bytes).unwrap();
@@ -475,7 +475,7 @@ mod tests {
         let shared = shared();
         let frame = frame(&shared);
         let words = shared.read().unwrap();
-        let raw = build_index(&BufferSource(&frame), frame.schema(), &words).unwrap();
+        let raw = frame.with_inner(|i| build_index(&BufferSource(i), frame.schema(), &words)).unwrap();
         let packed = compress_index(&raw, 3).unwrap();
         assert!(packed.len() < raw.len());
         let dir = tempfile::tempdir().unwrap();

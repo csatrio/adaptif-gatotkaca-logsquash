@@ -453,35 +453,43 @@ impl Frame {
     /// The matches of `prepared` in one unit: segments in order, then the buffer. `None` after the last unit.
     fn search_unit(&self, prepared: &[Prepared], unit: usize) -> Result<Option<Vec<u64>>> {
         let state = self.state.read().expect("frame lock poisoned");
-        let words = self.words.read().expect("word store lock poisoned");
-        let (base, rows) = if let Some(segment) = state.segments.get(unit) {
-            (segment.start, query::evaluate(&segment.reader, segment.index.as_ref(), &words, prepared)?)
-        } else if unit == state.segments.len() {
-            if state.active.is_empty() {
-                return Ok(Some(Vec::new()));
-            }
-            let index = self.active_index(&state, &words)?;
-            (state.committed_rows, query::evaluate(&BufferSource(&state.active), index.as_deref(), &words, prepared)?)
-        } else {
+        if let Some(segment) = state.segments.get(unit) {
+            let words = self.words.read().expect("word store lock poisoned");
+            let rows = query::evaluate(&segment.reader, segment.index.as_ref(), &words, prepared)?;
+            return Ok(Some(rows.into_iter().map(|r| segment.start + u64::from(r)).collect()));
+        }
+        if unit != state.segments.len() {
             return Ok(None);
-        };
+        }
+        // the buffer: its lock first, then the words (the order of push_row; see query::BufferSource)
+        let base = state.committed_rows;
+        let rows = state.active.with_inner(|inner| -> Result<Vec<u32>> {
+            if inner.rows == 0 {
+                return Ok(Vec::new());
+            }
+            let words = self.words.read().expect("word store lock poisoned");
+            let source = BufferSource(inner);
+            let index = self.active_index(&state, &source, &words)?;
+            query::evaluate(&source, index.as_deref(), &words, prepared)
+        })?;
         Ok(Some(rows.into_iter().map(|r| base + u64::from(r)).collect()))
     }
 
-    /// The index of the buffered rows, rebuilt when the buffer has grown since it was built.
-    fn active_index(&self, state: &FrameState, words: &WordStore) -> Result<Option<Arc<SegmentIndex>>> {
+    /// The index of the buffered rows, rebuilt when the buffer has grown since it was built. The caller holds the buffer
+    /// lock (`source`) and then the words.
+    fn active_index(&self, state: &FrameState, source: &BufferSource<'_>, words: &WordStore) -> Result<Option<Arc<SegmentIndex>>> {
         let flags = |c: &Column| c.flags.index_words || c.flags.case_insensitive || c.flags.index_equality;
         if !self.schema.columns().iter().any(flags) {
             return Ok(None);
         }
-        let rows = state.active.len();
+        let rows = source.row_count();
         let mut cache = state.active_index.lock().expect("index cache lock poisoned");
         if let Some((cached_rows, index)) = &*cache {
             if *cached_rows == rows {
                 return Ok(Some(Arc::clone(index)));
             }
         }
-        let bytes = build_index(&BufferSource(&state.active), &self.schema, words)?;
+        let bytes = build_index(source, &self.schema, words)?;
         let index = Arc::new(SegmentIndex::from_vec(bytes)?);
         *cache = Some((rows, Arc::clone(&index)));
         Ok(Some(index))
@@ -837,11 +845,13 @@ impl Store {
                 continue;
             }
             let file = format!("f{}-{:06}.seg", frame.id, guard.next_segment);
-            let result = guard.active.with_inner(|inner| write_segment(&self.dir.join(&file), inner, write_options)).and_then(|()| {
+            let result = guard.active.with_inner(|inner| {
+                write_segment(&self.dir.join(&file), inner, write_options)?;
                 match self.options.indexing {
+                    // the buffer lock is held: the words after it (see query::BufferSource)
                     true => {
                         let words = self.words.read().expect("word store lock poisoned");
-                        write_index(&self.dir, &self.options, &frame.schema, &BufferSource(&guard.active), &words, &file)
+                        write_index(&self.dir, &self.options, &frame.schema, &BufferSource(inner), &words, &file)
                     }
                     false => Ok(()),
                 }
@@ -1072,6 +1082,65 @@ mod tests {
 
     fn all_rows(frame: &Frame) -> Vec<Vec<OwnedValue>> {
         frame.rows().map(|r| r.unwrap()).collect()
+    }
+
+    /// A search over the buffered rows while another thread pushes rows with new words (and a third commits) must not
+    /// deadlock: the buffer lock comes before the word store on every path (query::BufferSource).
+    #[test]
+    fn concurrent_push_search_and_commit_do_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::create(dir.path(), StoreOptions { segment_rows: 1 << 30, ..options() }).unwrap());
+        let schema = Schema::new(vec![
+            Column::new("run", ColumnType::U64).index_equality(),
+            Column::new("id", ColumnType::U64),
+            Column::new("text", ColumnType::String).index_words().case_insensitive(),
+        ])
+        .unwrap();
+        store.create_frame("events", schema).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
+        let mut threads = Vec::new();
+        {
+            let (store, tx) = (store.clone(), done_tx.clone());
+            threads.push(std::thread::spawn(move || {
+                let frame = store.frame("events").unwrap();
+                for id in 0..3000u64 {
+                    // every row brings new words, so each push takes the word store for writing
+                    let text = format!("tool output w{id} x{} y{}", id * 7, id * 13);
+                    frame.push_row(&[Value::U64(id % 3), Value::U64(id), Value::Str(&text)]).unwrap();
+                }
+                tx.send("writer").unwrap();
+            }));
+        }
+        for n in 0..3u64 {
+            let (store, stop) = (store.clone(), stop.clone());
+            threads.push(std::thread::spawn(move || {
+                let frame = store.frame("events").unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    let q = Query::new().equals(0, Value::U64(n)).range(1, Some(Value::U64(0)), None);
+                    for row in frame.search(&q).unwrap() {
+                        frame.value(row.unwrap(), 2).unwrap();
+                    }
+                }
+            }));
+        }
+        {
+            let (store, stop) = (store.clone(), stop.clone());
+            threads.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(3));
+                    store.commit().unwrap();
+                }
+            }));
+        }
+        let r = done_rx.recv_timeout(std::time::Duration::from_secs(60));
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(r, Ok("writer"), "push, search and commit deadlocked");
+        for t in threads {
+            t.join().unwrap();
+        }
+        store.commit().unwrap();
+        assert_eq!(store.frame("events").unwrap().len(), 3000);
     }
 
     #[test]
