@@ -18,7 +18,7 @@ use crate::heap::{Heap, MemHeap};
 use crate::index::{SegmentIndex, WordTable, build_index, compress_index, write_file_atomically};
 use crate::query::{self, BufferSource, Page, PageResult, Prepared, Query, RowSource};
 use crate::schema::{Column, ColumnFlags, Schema};
-use crate::segment::{SegmentReader, WriteOptions, write_segment};
+use crate::segment::{DEFAULT_MAX_OPEN_SEGMENTS, FilePool, SegmentReader, WriteOptions, write_segment};
 use crate::tokenizer::TokenizerOptions;
 use crate::types::{ColumnType, OwnedValue, Value};
 use crate::varint;
@@ -602,6 +602,8 @@ pub struct Store {
     frames: RwLock<Vec<Arc<Frame>>>,
     /// The sorted word table, present once the store has been sealed.
     word_table: RwLock<Option<WordTable>>,
+    /// The open segment files of all dataframes, at most [`Store::max_open_segments`] of them.
+    segment_files: Arc<FilePool>,
     /// Held for as long as the store is open for writing.
     _lock: Option<File>,
 }
@@ -638,6 +640,7 @@ impl Store {
             committed: Mutex::new(committed),
             frames: RwLock::new(Vec::new()),
             word_table: RwLock::new(None),
+            segment_files: FilePool::new(DEFAULT_MAX_OPEN_SEGMENTS),
             _lock: Some(lock),
         })
     }
@@ -683,13 +686,15 @@ impl Store {
         let words = WordStore::from_heap(heap, Dictionary::new(limit))?.into_shared();
         let flag = Arc::new(AtomicBool::new(writable));
         let write_mutex = Arc::new(Mutex::new(()));
+        let segment_files = FilePool::new(DEFAULT_MAX_OPEN_SEGMENTS);
 
         let mut frames = Vec::new();
         for (id, meta) in manifest.frames.iter().enumerate() {
             let mut segments = Vec::new();
             let mut start = 0;
             for segment in &meta.segments {
-                let reader = SegmentReader::open(&dir.join(&segment.file), meta.schema.len())?.with_cache_limit(options.cache_bytes);
+                let reader =
+                    SegmentReader::open(&dir.join(&segment.file), meta.schema.len(), &segment_files)?.with_cache_limit(options.cache_bytes);
                 if reader.rows() != segment.rows {
                     return Err(Error::Corrupt("segment row count differs from the manifest"));
                 }
@@ -727,6 +732,7 @@ impl Store {
             committed: Mutex::new(committed),
             frames: RwLock::new(frames),
             word_table: RwLock::new(word_table),
+            segment_files,
             _lock: lock,
         })
     }
@@ -739,6 +745,25 @@ impl Store {
     /// The folder.
     pub fn path(&self) -> &Path {
         &self.dir
+    }
+
+    /// The most segment files the store keeps open at once (default 64). Each committed segment is read from its own
+    /// file; when more segments than this are read, the least recently used file is closed and opened again on its next
+    /// read. Files that a read is using at that moment are closed when the read ends, so the count can briefly exceed
+    /// the limit by the number of reads in progress.
+    pub fn max_open_segments(&self) -> usize {
+        self.segment_files.limit()
+    }
+
+    /// Changes the most segment files the store keeps open (at least 1; see [`Store::max_open_segments`]). Lowering it
+    /// closes the least recently used files at once. Read results do not depend on it, only how often a file is reopened.
+    pub fn set_max_open_segments(&self, limit: usize) {
+        self.segment_files.set_limit(limit);
+    }
+
+    /// Segment files the store has open now.
+    pub fn open_segment_files(&self) -> usize {
+        self.segment_files.open_files()
     }
 
     /// Whether rows can still be added.
@@ -904,7 +929,8 @@ impl Store {
         // The manifest is replaced: the commit happened. Now switch the in-memory state over.
         for (i, file, rows) in written {
             let guard = &mut guards[i];
-            let reader = SegmentReader::open(&self.dir.join(&file), frames[i].schema.len())?.with_cache_limit(self.options.cache_bytes);
+            let reader = SegmentReader::open(&self.dir.join(&file), frames[i].schema.len(), &self.segment_files)?
+                .with_cache_limit(self.options.cache_bytes);
             let start = guard.committed_rows;
             let index_path = self.dir.join(file.replace(".seg", ".idx"));
             let index = if index_path.exists() { Some(SegmentIndex::open(&index_path)?) } else { None };
@@ -937,6 +963,7 @@ impl Store {
         let heap = read_heap(&dir.join("heap.bin"), manifest.heap_bytes, manifest.heap_words)?;
         let words = WordStore::from_heap(heap, Dictionary::new(usize::MAX))?;
         let mut report = IndexReport { segments_indexed: 0, word_table_written: false };
+        let segment_files = FilePool::new(1);
         for frame in &manifest.frames {
             let flags = |c: &Column| c.flags.index_words || c.flags.case_insensitive || c.flags.index_equality;
             if !frame.schema.columns().iter().any(flags) {
@@ -946,7 +973,7 @@ impl Store {
                 if dir.join(segment.file.replace(".seg", ".idx")).exists() {
                     continue;
                 }
-                let reader = SegmentReader::open(&dir.join(&segment.file), frame.schema.len())?;
+                let reader = SegmentReader::open(&dir.join(&segment.file), frame.schema.len(), &segment_files)?;
                 write_index(dir, &options, &frame.schema, &reader, &words, &segment.file)?;
                 report.segments_indexed += 1;
             }
@@ -1868,5 +1895,193 @@ mod tests {
             OwnedValue::U64(crate::cell::from_signed(0))
         );
         assert!(matches!(Store::create(dir.path(), options()), Err(Error::Io(_))));
+    }
+
+    /// Open `*.seg` files of this process inside `dir`, counted from `/proc/self/fd`.
+    #[cfg(target_os = "linux")]
+    fn seg_fds(dir: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .filter(|t| t.starts_with(dir) && t.extension().is_some_and(|x| x == "seg"))
+            .count()
+    }
+
+    fn msg_of(id: u64) -> String {
+        format!("request {} from host-{} finished with status {}", id % 13, id % 5, 200 + id % 3)
+    }
+
+    /// Everything the read API returns for a frame, as text: rows, single values, strings, searches, counts and pages.
+    /// `check` runs after every read.
+    fn read_everything(frame: &Frame, check: &dyn Fn()) -> Vec<String> {
+        let mut out = Vec::new();
+        for row in frame.rows() {
+            out.push(format!("{:?}", row.unwrap()));
+            check();
+        }
+        let mut buf = BytesMut::new();
+        for row in (0..frame.len()).rev().step_by(7) {
+            for column in 0..frame.schema().len() {
+                out.push(format!("{:?}", frame.value(row, column).unwrap()));
+            }
+            buf.clear();
+            let present = frame.write_string(row, 2, &mut buf).unwrap();
+            out.push(format!("{present} {:?}", &buf[..]));
+            check();
+        }
+        let queries = [
+            Query::new().word(1, "host"),
+            Query::new().word(1, "request").equals(0, Value::U64(17)),
+            Query::new().phrase(1, "from host-3 finished"),
+            Query::new().word_ci(1, "STATUS").range(0, Some(Value::U64(100)), Some(Value::U64(400))),
+            Query::new().range(4, Some(Value::F64(10.0)), Some(Value::F64(60.0))),
+            Query::new().phrase(2, "line one\nline 4"),
+        ];
+        for q in &queries {
+            let rows: Vec<u64> = frame.search(q).unwrap().map(|r| r.unwrap()).collect();
+            out.push(format!("{rows:?} {}", frame.count(q).unwrap()));
+            check();
+            for order_by in [None, Some(OrderBy { column: 0, descending: true }), Some(OrderBy { column: 4, descending: false })] {
+                let page = frame.search_page(q, &Page { order_by, offset: 3, limit: 25 }).unwrap();
+                out.push(format!("{page:?}"));
+                check();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn many_segments_read_the_same_with_few_open_files() {
+        const SEGMENTS: u64 = 200;
+        const ROWS: u64 = 4;
+        const LIMIT: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        assert_eq!(store.max_open_segments(), 64);
+        store.set_max_open_segments(LIMIT);
+        let frame = store.create_frame("events", schema()).unwrap();
+        let bounded = |store: &Store| {
+            assert!(store.open_segment_files() <= LIMIT, "{} open", store.open_segment_files());
+            #[cfg(target_os = "linux")]
+            assert!(seg_fds(dir.path()) <= LIMIT, "{} descriptors", seg_fds(dir.path()));
+        };
+        for s in 0..SEGMENTS {
+            for i in 0..ROWS {
+                push(&frame, s * ROWS + i);
+            }
+            store.commit().unwrap();
+            bounded(&store);
+            // read across every segment so far now and then, while committing
+            if s % 50 == 49 {
+                let q = Query::new().word(1, "request");
+                assert_eq!(frame.count(&q).unwrap(), (s + 1) * ROWS);
+                bounded(&store);
+            }
+        }
+        assert_eq!(frame.len(), SEGMENTS * ROWS);
+        #[cfg(target_os = "linux")]
+        assert!(seg_fds(dir.path()) <= LIMIT);
+        let written = read_everything(&frame, &|| bounded(&store));
+        for row in 0..frame.len() {
+            assert_eq!(frame.value(row, 0).unwrap(), OwnedValue::U64(row));
+        }
+        drop((frame, store));
+
+        // the reference: a store that keeps every file open
+        let wide = Store::open_read_only(dir.path(), options()).unwrap();
+        wide.set_max_open_segments(usize::MAX);
+        let expected = read_everything(&wide.frame("events").unwrap(), &|| {});
+        assert_eq!(wide.open_segment_files(), SEGMENTS as usize, "nothing was closed");
+        #[cfg(target_os = "linux")]
+        assert_eq!(seg_fds(dir.path()), SEGMENTS as usize);
+        drop(wide);
+        #[cfg(target_os = "linux")]
+        assert_eq!(seg_fds(dir.path()), 0, "dropping the store closes its files");
+
+        let narrow = Store::open_read_only(dir.path(), options()).unwrap();
+        assert!(narrow.open_segment_files() <= 64);
+        narrow.set_max_open_segments(LIMIT);
+        let read = read_everything(&narrow.frame("events").unwrap(), &|| bounded(&narrow));
+        assert_eq!(written, expected);
+        assert_eq!(read, expected);
+        narrow.verify().unwrap();
+        bounded(&narrow);
+        narrow.set_max_open_segments(1);
+        assert!(narrow.open_segment_files() <= 1);
+        assert_eq!(read_everything(&narrow.frame("events").unwrap(), &|| assert!(narrow.open_segment_files() <= 1)), expected);
+    }
+
+    /// Readers on several threads while another thread pushes and commits, with fewer open files allowed than segments:
+    /// files are closed and reopened under the readers' feet, and every read must still be right.
+    #[test]
+    fn concurrent_reads_and_commits_with_few_open_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::create(dir.path(), options()).unwrap());
+        store.set_max_open_segments(3);
+        let frame = store.create_frame("events", schema()).unwrap();
+        for id in 0..60 {
+            push(&frame, id);
+            if id % 3 == 2 {
+                store.commit().unwrap();
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
+        let mut threads = Vec::new();
+        {
+            let (store, tx) = (store.clone(), done_tx.clone());
+            threads.push(std::thread::spawn(move || {
+                let frame = store.frame("events").unwrap();
+                for id in 60..600u64 {
+                    assert_eq!(push(&frame, id), id);
+                    if id % 4 == 3 {
+                        store.commit().unwrap();
+                    }
+                }
+                store.commit().unwrap();
+                tx.send("writer").unwrap();
+            }));
+        }
+        for n in 0..4u64 {
+            let (store, stop) = (store.clone(), stop.clone());
+            threads.push(std::thread::spawn(move || {
+                let frame = store.frame("events").unwrap();
+                let mut buf = BytesMut::new();
+                let mut x = n + 1;
+                while !stop.load(Ordering::Relaxed) {
+                    let len = frame.len();
+                    for _ in 0..20 {
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let row = (x >> 33) % len;
+                        assert_eq!(frame.value(row, 0).unwrap(), OwnedValue::U64(row));
+                        buf.clear();
+                        assert!(frame.write_string(row, 1, &mut buf).unwrap());
+                        assert_eq!(&buf[..], msg_of(row).as_bytes());
+                    }
+                    let k = (x >> 20) % len;
+                    let q = Query::new().equals(0, Value::U64(k));
+                    assert_eq!(frame.search(&q).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>(), vec![k]);
+                    let q = Query::new().range(0, Some(Value::U64(0)), Some(Value::U64(len - 1)));
+                    assert!(frame.count(&q).unwrap() >= len);
+                }
+            }));
+        }
+        let r = done_rx.recv_timeout(std::time::Duration::from_secs(120));
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(r, Ok("writer"), "reads and commits deadlocked");
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(frame.len(), 600);
+        assert!(store.open_segment_files() <= 3);
+        let rows = all_rows(&frame);
+        for (id, row) in rows.iter().enumerate() {
+            assert_eq!(row[0], OwnedValue::U64(id as u64));
+        }
+        drop((frame, store));
+        let wide = Store::open_read_only(dir.path(), options()).unwrap();
+        wide.set_max_open_segments(usize::MAX);
+        assert_eq!(all_rows(&wide.frame("events").unwrap()), rows);
     }
 }

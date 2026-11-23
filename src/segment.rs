@@ -20,7 +20,8 @@ use crate::words::WordStore;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const MAGIC: &[u8; 8] = b"LSQSEG01";
@@ -28,6 +29,8 @@ const FOOTER_MAGIC: &[u8; 8] = b"LSQSEGEN";
 const FOOTER_LEN: u64 = 8 + 4 + 4 + 8 + 8;
 /// Default size limit of the decoded-block cache of one segment reader, in bytes.
 pub(crate) const DEFAULT_CACHE_BYTES: usize = 32 << 20;
+/// Default number of segment files a store keeps open at once.
+pub(crate) const DEFAULT_MAX_OPEN_SEGMENTS: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 struct BlockRef {
@@ -213,12 +216,168 @@ enum Cached {
     Heap(Arc<Vec<u8>>),
 }
 
-/// Reads rows of one segment file lazily, block by block.
-pub(crate) struct SegmentReader {
+/// An open segment file shared by the pool and the reads that use it. Dropping it closes the file.
+struct Handle {
     file: Mutex<File>,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct PoolState {
+    /// Most files kept open (at least 1).
+    limit: usize,
+    /// Counter of uses, for least-recently-used eviction.
+    tick: u64,
+    next_id: u64,
+    /// Open file of each reader that has one: `reader id -> (handle, last use)`.
+    open: HashMap<u64, (Arc<Handle>, u64)>,
+}
+
+impl PoolState {
+    /// Closes the least recently used files until at most `limit` are open, never the one of `keep`. The handles are
+    /// returned so that the caller drops (closes) them after releasing the pool lock.
+    fn evict(&mut self, keep: Option<u64>) -> Vec<Arc<Handle>> {
+        let mut closed = Vec::new();
+        while self.open.len() > self.limit {
+            let oldest = self.open.iter().filter(|(id, _)| Some(**id) != keep).min_by_key(|(_, (_, used))| *used).map(|(id, _)| *id);
+            match oldest.and_then(|id| self.open.remove(&id)) {
+                Some((handle, _)) => closed.push(handle),
+                None => break,
+            }
+        }
+        closed
+    }
+}
+
+/// The open segment files of one store, bounded by a limit and evicted least recently used first. A reader whose file
+/// was closed opens it again on its next read.
+///
+/// Locking: the pool lock is only held to look up, insert or remove a handle, never while a file lock or a reader's
+/// cache lock is held, and no other lock is taken while it is held. A read clones the handle out of the pool, releases
+/// the pool lock and then locks the file, so an eviction during a read only closes the file once that read is done
+/// (the number of open files can exceed the limit by the reads in progress).
+pub(crate) struct FilePool {
+    state: Mutex<PoolState>,
+    /// Open files, including evicted ones still used by a read.
+    live: Arc<AtomicUsize>,
+}
+
+impl FilePool {
+    pub(crate) fn new(limit: usize) -> Arc<Self> {
+        let state = PoolState { limit: limit.max(1), ..PoolState::default() };
+        Arc::new(Self { state: Mutex::new(state), live: Arc::new(AtomicUsize::new(0)) })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        self.state.lock().expect("segment file pool lock poisoned")
+    }
+
+    /// The limit of open files.
+    pub(crate) fn limit(&self) -> usize {
+        self.lock().limit
+    }
+
+    /// Changes the limit (at least 1), closing files if there are too many.
+    pub(crate) fn set_limit(&self, limit: usize) {
+        let closed = {
+            let mut state = self.lock();
+            state.limit = limit.max(1);
+            state.evict(None)
+        };
+        drop(closed);
+    }
+
+    /// Segment files open now (those in the pool plus evicted ones that a read still uses).
+    pub(crate) fn open_files(&self) -> usize {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    fn register(&self) -> u64 {
+        let mut state = self.lock();
+        state.next_id += 1;
+        state.next_id
+    }
+
+    fn get(&self, id: u64) -> Option<Arc<Handle>> {
+        let mut state = self.lock();
+        state.tick += 1;
+        let tick = state.tick;
+        state.open.get_mut(&id).map(|(handle, used)| {
+            *used = tick;
+            Arc::clone(handle)
+        })
+    }
+
+    /// Adds the file of reader `id` (or returns the one another thread added meanwhile), closing the least recently used.
+    fn insert(&self, id: u64, file: File) -> Arc<Handle> {
+        let (handle, closed) = {
+            let mut state = self.lock();
+            state.tick += 1;
+            let tick = state.tick;
+            if let Some((handle, used)) = state.open.get_mut(&id) {
+                *used = tick;
+                return Arc::clone(handle);
+            }
+            self.live.fetch_add(1, Ordering::Relaxed);
+            let handle = Arc::new(Handle { file: Mutex::new(file), live: Arc::clone(&self.live) });
+            state.open.insert(id, (Arc::clone(&handle), tick));
+            (handle, state.evict(Some(id)))
+        };
+        drop(closed);
+        handle
+    }
+
+    fn remove(&self, id: u64) {
+        let closed = self.lock().open.remove(&id);
+        drop(closed);
+    }
+}
+
+/// What identifies the file a reader opened, checked when it is opened again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    len: u64,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl FileId {
+    fn of(file: &File) -> Result<Self> {
+        let meta = file.metadata()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self { len: meta.len(), dev: meta.dev(), ino: meta.ino() })
+        }
+        #[cfg(not(unix))]
+        Ok(Self { len: meta.len() })
+    }
+}
+
+/// Reads rows of one segment file lazily, block by block. The file is opened through the store's [`FilePool`]; when the
+/// pool has closed it, the next block read opens it again.
+pub(crate) struct SegmentReader {
+    path: PathBuf,
+    file_id: FileId,
+    id: u64,
+    pool: Arc<FilePool>,
     index: Index,
     cache: Mutex<Cache>,
     cache_limit: usize,
+}
+
+impl Drop for SegmentReader {
+    fn drop(&mut self) {
+        self.pool.remove(self.id);
+    }
 }
 
 /// Decoded blocks kept for reuse, cleared when they exceed the size limit.
@@ -229,10 +388,11 @@ struct Cache {
 }
 
 impl SegmentReader {
-    /// Opens a segment and verifies its header, footer and index.
-    pub(crate) fn open(path: &Path, columns: usize) -> Result<Self> {
+    /// Opens a segment and verifies its header, footer and index. Its file stays open in `pool` until evicted.
+    pub(crate) fn open(path: &Path, columns: usize, pool: &Arc<FilePool>) -> Result<Self> {
         let mut file = File::open(path)?;
-        let len = file.metadata()?.len();
+        let file_id = FileId::of(&file)?;
+        let len = file_id.len;
         if len < MAGIC.len() as u64 + FOOTER_LEN {
             return Err(Error::Corrupt("segment file is too short"));
         }
@@ -259,7 +419,30 @@ impl SegmentReader {
         if index.columns as usize != columns {
             return Err(Error::Corrupt("segment column count"));
         }
-        Ok(Self { file: Mutex::new(file), index, cache: Mutex::new(Cache::default()), cache_limit: DEFAULT_CACHE_BYTES })
+        let id = pool.register();
+        pool.insert(id, file);
+        Ok(Self {
+            path: path.to_path_buf(),
+            file_id,
+            id,
+            pool: Arc::clone(pool),
+            index,
+            cache: Mutex::new(Cache::default()),
+            cache_limit: DEFAULT_CACHE_BYTES,
+        })
+    }
+
+    /// The open file of the segment, opened again if the pool closed it. A file that is gone fails with the error of
+    /// opening it; a different file at the same path (another length or, on Unix, another inode) is an error too.
+    fn handle(&self) -> Result<Arc<Handle>> {
+        if let Some(handle) = self.pool.get(self.id) {
+            return Ok(handle);
+        }
+        let file = File::open(&self.path)?;
+        if FileId::of(&file)? != self.file_id {
+            return Err(Error::Io(std::io::Error::other("segment file was replaced while the store was open")));
+        }
+        Ok(self.pool.insert(self.id, file))
     }
 
     /// Reads and checks every block of the segment.
@@ -294,7 +477,9 @@ impl SegmentReader {
     fn read_block(&self, block: &BlockRef) -> Result<Vec<u8>> {
         let mut comp = vec![0u8; block.comp_len as usize];
         {
-            let mut file = self.file.lock().expect("segment file lock poisoned");
+            // the pool lock is released by now: only the file lock is held while reading
+            let handle = self.handle()?;
+            let mut file = handle.file.lock().expect("segment file lock poisoned");
             file.seek(SeekFrom::Start(block.offset))?;
             file.read_exact(&mut comp)?;
         }
@@ -479,6 +664,10 @@ mod tests {
         frame
     }
 
+    fn pool() -> Arc<FilePool> {
+        FilePool::new(DEFAULT_MAX_OPEN_SEGMENTS)
+    }
+
     fn write(frame: &DataFrame, dir: &Path, block_rows: usize) -> std::path::PathBuf {
         let path = dir.join("a.seg");
         frame.with_inner(|inner| write_segment(&path, inner, WriteOptions { block_rows, zstd_level: 3 })).unwrap();
@@ -491,7 +680,7 @@ mod tests {
         let frame = filled(&shared, 1000);
         let dir = tempfile::tempdir().unwrap();
         let path = write(&frame, dir.path(), 64);
-        let reader = SegmentReader::open(&path, 5).unwrap();
+        let reader = SegmentReader::open(&path, 5, &pool()).unwrap();
         assert_eq!(reader.rows(), 1000);
         let store = shared.read().unwrap();
         for row in (0..1000).chain([999, 0, 500]) {
@@ -509,7 +698,7 @@ mod tests {
         let shared = words();
         let frame = filled(&shared, 100);
         let dir = tempfile::tempdir().unwrap();
-        let reader = SegmentReader::open(&write(&frame, dir.path(), 40), 5).unwrap();
+        let reader = SegmentReader::open(&write(&frame, dir.path(), 40), 5, &pool()).unwrap();
         let (min, max, non_null) = reader.column_block_stats(1, 0); // ids 40..79 are -10..29
         assert_eq!((min, max, non_null), (crate::cell::from_signed(-10), crate::cell::from_signed(29), 40));
         let (_, _, score_non_null) = reader.column_block_stats(0, 1); // rows 0, 5, 10, ... are null
@@ -521,12 +710,12 @@ mod tests {
         let shared = words();
         let dir = tempfile::tempdir().unwrap();
         let empty = DataFrame::new(schema(), shared.clone());
-        let reader = SegmentReader::open(&write(&empty, dir.path(), 64), 5).unwrap();
+        let reader = SegmentReader::open(&write(&empty, dir.path(), 64), 5, &pool()).unwrap();
         assert_eq!(reader.rows(), 0);
         let nulls = DataFrame::new(schema(), shared.clone());
         nulls.push_row(&[Value::Null, Value::Null, Value::Null, Value::Null, Value::Null]).unwrap();
         let dir2 = tempfile::tempdir().unwrap();
-        let reader = SegmentReader::open(&write(&nulls, dir2.path(), 64), 5).unwrap();
+        let reader = SegmentReader::open(&write(&nulls, dir2.path(), 64), 5, &pool()).unwrap();
         let store = shared.read().unwrap();
         assert_eq!(reader.row(nulls.schema(), &store, 0).unwrap(), vec![OwnedValue::Null; 5]);
         assert_eq!(reader.column_block_stats(0, 2), (0, 0, 0));
@@ -545,7 +734,7 @@ mod tests {
         let mut bad = good.clone();
         bad[100] ^= 0xff;
         std::fs::write(&path, &bad).unwrap();
-        let reader = SegmentReader::open(&path, 5).unwrap();
+        let reader = SegmentReader::open(&path, 5, &pool()).unwrap();
         let all_ok = (0..300).all(|row| reader.row(frame.schema(), &store, row).is_ok());
         assert!(!all_ok);
 
@@ -554,12 +743,67 @@ mod tests {
             let mut bad = good.clone();
             bad[position] ^= 0x55;
             std::fs::write(&path, &bad).unwrap();
-            assert!(SegmentReader::open(&path, 5).is_err(), "byte {position}");
+            assert!(SegmentReader::open(&path, 5, &pool()).is_err(), "byte {position}");
         }
         std::fs::write(&path, &good[..good.len() - 5]).unwrap();
-        assert!(SegmentReader::open(&path, 5).is_err());
+        assert!(SegmentReader::open(&path, 5, &pool()).is_err());
         std::fs::write(&path, &good).unwrap();
-        assert!(SegmentReader::open(&path, 4).is_err()); // wrong column count
-        assert!(SegmentReader::open(&path, 5).is_ok());
+        assert!(SegmentReader::open(&path, 4, &pool()).is_err()); // wrong column count
+        assert!(SegmentReader::open(&path, 5, &pool()).is_ok());
+    }
+
+    #[test]
+    fn readers_reopen_files_closed_by_the_pool() {
+        let shared = words();
+        let frame = filled(&shared, 300);
+        let dirs: Vec<_> = (0..5).map(|_| tempfile::tempdir().unwrap()).collect();
+        let pool = FilePool::new(2);
+        let readers: Vec<_> = dirs.iter().map(|d| SegmentReader::open(&write(&frame, d.path(), 32), 5, &pool).unwrap()).collect();
+        assert_eq!(pool.open_files(), 2);
+        let store = shared.read().unwrap();
+        for round in 0..3 {
+            for (i, reader) in readers.iter().enumerate() {
+                // a fresh reader of the same file has an empty cache, so every block read goes to the file
+                let fresh = SegmentReader::open(&dirs[i].path().join("a.seg"), 5, &pool).unwrap().with_cache_limit(0);
+                for row in (round..300).step_by(37) {
+                    assert_eq!(reader.row(frame.schema(), &store, row).unwrap(), frame.row(row).unwrap());
+                    assert_eq!(fresh.row(frame.schema(), &store, row).unwrap(), frame.row(row).unwrap());
+                    assert!(pool.open_files() <= 2);
+                }
+            }
+        }
+        drop(readers);
+        assert!(pool.open_files() <= 2);
+        pool.set_limit(1);
+        assert!(pool.open_files() <= 1);
+        let reader = SegmentReader::open(&dirs[0].path().join("a.seg"), 5, &pool).unwrap();
+        drop(reader);
+        assert_eq!(pool.open_files(), 0, "a dropped reader closes its file");
+    }
+
+    #[test]
+    fn a_missing_or_replaced_file_fails_after_eviction() {
+        let shared = words();
+        let frame = filled(&shared, 300);
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let pool = FilePool::new(1);
+        let first = SegmentReader::open(&write(&frame, a.path(), 32), 5, &pool).unwrap().with_cache_limit(0);
+        let second = SegmentReader::open(&write(&frame, b.path(), 32), 5, &pool).unwrap().with_cache_limit(0);
+        let store = shared.read().unwrap();
+        assert!(first.row(frame.schema(), &store, 1).is_ok());
+        assert!(second.row(frame.schema(), &store, 1).is_ok()); // closes the file of `first`
+
+        std::fs::remove_file(a.path().join("a.seg")).unwrap();
+        let err = first.row(frame.schema(), &store, 2).unwrap_err();
+        assert!(matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound), "{err:?}");
+        assert!(second.row(frame.schema(), &store, 2).is_ok());
+
+        // a different file under the same name is not read in place of the old one
+        drop(store);
+        let other = filled(&shared, 299);
+        write(&other, a.path(), 32);
+        let store = shared.read().unwrap();
+        assert!(matches!(first.row(frame.schema(), &store, 2), Err(Error::Io(_))));
+        assert!(second.row(frame.schema(), &store, 3).is_ok());
     }
 }
