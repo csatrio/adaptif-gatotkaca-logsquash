@@ -201,6 +201,11 @@ let options = StoreOptions {
 | `compress_indexes` | true | zstd-compress index files; off means memory-mapped. |
 | `tokenizer` | see docs | Thresholds of inline-run detection. |
 
+A store keeps at most 64 segment files open (least recently used first out; a closed file is reopened on its next
+read). Change it on an open store with `store.set_max_open_segments(n)`; `store.open_segment_files()` reports how many
+are open. It is a `Store` method rather than a `StoreOptions` field so that 0.1.x stays compatible with code that
+builds `StoreOptions` with every field listed.
+
 ## Feature flags
 
 | Feature | Default | Effect |
@@ -263,6 +268,9 @@ entropy thresholds) are in [DESIGN.md](DESIGN.md), section 13. Reproduce with
   and no row is half-written: seal this folder and create a new one.
 - Search is on symbols, not substrings. Use `word`, `phrase` and `equals`; there is no substring or regex search.
 - Index files are not noticed by stores that are already open; reopen after `build_indexes`.
+- Open segment files are bounded per store (64 by default, see `Store::set_max_open_segments`), so a long-lived store
+  that commits often does not run out of file descriptors. Segment files must stay in place while a store uses them:
+  a reader whose file was closed and then deleted or replaced gets `Error::Io` on its next read.
 - The format is versioned; a folder written with another format or splitter version fails with
   `Error::UnsupportedVersion`.
 - Text types are validated: out-of-range numbers, bad dates and over-precise times are errors.
