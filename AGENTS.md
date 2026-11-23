@@ -18,7 +18,9 @@ see the whole flow.
 ## 2. Golden rules
 
 1. **One writer per folder.** A second `Store::create`/`open` for writing fails with `Error::Locked`. Share one
-   `Arc<Store>`/`Arc<Frame>` between threads instead; `push_row` and `commit` are serialized for you.
+   `Arc<Store>`/`Arc<Frame>` between threads instead; `push_row` and `commit` are serialized for you, and searches and
+   reads may run on other threads at the same time (use 0.1.1 or later: 0.1.0 could deadlock a search of uncommitted
+   rows against a concurrent `push_row`).
 2. **Always `commit` before you stop, and `seal` at the end of the period.** Rows that are not committed are lost on
    exit. `seal` finishes the indexes and the word table and closes the store for writing.
 3. **Call `commit_if_full()` regularly while writing** (for example every 1,000 rows). It commits at `segment_rows`
@@ -156,5 +158,5 @@ showed no useful gain. Details: DESIGN.md section 13.
 ## 8. Testing code that uses the crate
 
 Use `tempfile::tempdir()` for the folder, `StoreOptions { zstd_level: 3, ..Default::default() }` to be fast, and compare a
-search result against a plain filter over the rows you inserted. The crate's own tests do the same: 96 tests including
+search result against a plain filter over the rows you inserted. The crate's own tests do the same: 97 tests including
 `proptest` round trips.
