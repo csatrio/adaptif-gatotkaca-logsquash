@@ -36,12 +36,6 @@ pub mod types;
 pub mod varint;
 pub mod words;
 
-/// Tests that spawn child processes hold this for writing while they spawn; a store releases its writer lock under it
-/// for reading. A forked child holds copies of every open file until it executes, which would keep a writer lock that
-/// the test process just released and make a reopen fail with `Error::Locked`.
-#[cfg(test)]
-pub(crate) static TEST_SPAWN_GUARD: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
 pub use dataframe::{DataFrame, DataFrameOptions, Rows};
 pub use dictionary::{Dictionary, ENTRY_COST_BYTES};
 pub use error::{Error, Result};

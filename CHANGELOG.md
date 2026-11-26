@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-27
+
+### Fixed
+
+- Dropping a writable store and reopening it at once could fail with `Error::Locked` while another thread of the
+  process was spawning a child process: the child shared the lock file until it executed. The writer lock is now
+  unlocked explicitly when the store is dropped (only by the process that took it), so the reopen always succeeds.
+
 ## [0.2.0] - 2026-11-27
 
 Version 2: the pending buffer in memory-mapped files, live readers and a commit policy (DESIGN.md section 14).

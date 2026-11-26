@@ -981,20 +981,29 @@ pub struct Store {
 }
 
 /// The writer lock of a folder (an exclusive advisory lock on its `lock` file), released when dropped.
-struct WriterLock(Option<File>);
+struct WriterLock {
+    file: File,
+    /// The process that took the lock.
+    owner: u32,
+}
 
 impl Drop for WriterLock {
+    /// Unlocks explicitly before the file is closed. On Unix the lock belongs to the open file, which a child process
+    /// forked by another thread shares until it executes: closing only our handle would leave the lock held by the
+    /// child's copy, and an immediate reopen would fail with `Error::Locked`. An unlock through any copy releases it
+    /// for all. Only the process that took the lock unlocks: a forked child that drops an inherited store must not
+    /// release its parent's lock. On Windows the explicit unlock also makes the release immediate.
     fn drop(&mut self) {
-        #[cfg(test)]
-        let _guard = crate::TEST_SPAWN_GUARD.read().unwrap_or_else(|e| e.into_inner());
-        drop(self.0.take());
+        if self.owner == std::process::id() {
+            let _ = fs4::FileExt::unlock(&self.file);
+        }
     }
 }
 
 fn acquire_writer_lock(dir: &Path) -> Result<WriterLock> {
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("lock"))?;
     match fs4::FileExt::try_lock(&file) {
-        Ok(()) => Ok(WriterLock(Some(file))),
+        Ok(()) => Ok(WriterLock { file, owner: std::process::id() }),
         Err(fs4::TryLockError::WouldBlock) => Err(Error::Locked),
         Err(fs4::TryLockError::Error(e)) => Err(e.into()),
     }
@@ -2078,6 +2087,36 @@ mod tests {
         assert!(matches!(reader.create_frame("x", schema()), Err(Error::ReadOnly)));
         store.commit().unwrap();
         assert_eq!(Store::open_read_only(dir.path(), options()).unwrap().frame("logs").unwrap().len(), 30);
+    }
+
+    /// A child process forked by another thread holds a copy of the lock file until it executes; dropping a store must
+    /// release the lock for that copy too, so an immediate reopen never fails with `Error::Locked`.
+    #[cfg(unix)]
+    #[test]
+    fn reopening_while_another_thread_spawns_children_is_never_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = || StoreOptions { pending: PendingMode::Memory, ..options() };
+        drop(Store::create(dir.path(), options()).unwrap());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let spawner = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            })
+        };
+        let mut locked = 0;
+        for _ in 0..1000 {
+            match Store::open(dir.path(), options()) {
+                Ok(store) => drop(store),
+                Err(Error::Locked) => locked += 1,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawner.join().unwrap();
+        assert_eq!(locked, 0, "spurious Error::Locked on reopen");
     }
 
     #[test]
@@ -3270,7 +3309,6 @@ mod tests {
 
     #[cfg(feature = "mmap")]
     fn spawn_child(role: &str, dir: &Path) -> std::process::Child {
-        let _guard = crate::TEST_SPAWN_GUARD.write().unwrap_or_else(|e| e.into_inner());
         std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "store::tests::child_process_entry", "--test-threads=1", "--nocapture"])
             .env("LSQ_STORE_CHILD", format!("{role}:{}", dir.display()))

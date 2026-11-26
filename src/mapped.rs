@@ -849,7 +849,6 @@ mod tests {
     }
 
     fn spawn_child(role: &str, dir: &Path) -> std::process::Child {
-        let _guard = crate::TEST_SPAWN_GUARD.write().unwrap_or_else(|e| e.into_inner());
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "mapped::tests::child_process_entry", "--test-threads=1", "--nocapture"])
             .env("LSQ_MAPPED_CHILD", format!("{role}:{}", dir.display()))
