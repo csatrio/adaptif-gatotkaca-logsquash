@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::heap::{Heap, MemHeap};
 use crate::schema::{Column, Schema};
 use crate::splitter::{DefaultSplitter, JsonEscapeSplitter, Splitter};
+use crate::sync::Unpoison;
 use crate::tokenizer::{Tokenizer, TokenizerOptions, decode_with};
 use crate::types::{ColumnType, OwnedValue, Value};
 use crate::varint;
@@ -199,7 +200,7 @@ impl<H: Heap> DataFrame<H> {
 
     /// Number of rows.
     pub fn len(&self) -> u64 {
-        self.inner.read().expect("dataframe lock poisoned").rows
+        self.inner.read().ignore_poison().rows
     }
 
     /// Whether there are no rows.
@@ -209,11 +210,11 @@ impl<H: Heap> DataFrame<H> {
 
     /// Appends a row and returns its row number. On any error nothing is added (not even new words).
     pub fn push_row(&self, row: &[Value<'_>]) -> Result<u64> {
-        let mut guard = self.inner.write().expect("dataframe lock poisoned");
+        let mut guard = self.inner.write().or_poisoned()?;
         let Inner { columns: data, rows, row_heap, block_starts, dedup, scratch } = &mut *guard;
         let mut entries = std::mem::take(scratch);
         let mut prepared = Vec::with_capacity(self.schema.len());
-        let mut words = self.encoder.words().write().expect("word store lock poisoned");
+        let mut words = self.encoder.words().write().or_poisoned()?;
         if let Err(e) = self.encoder.prepare_row(&mut words, row, &mut entries, &mut prepared) {
             *scratch = entries;
             return Err(e);
@@ -245,22 +246,22 @@ impl<H: Heap> DataFrame<H> {
 
     /// Reads one row.
     pub fn row(&self, row: u64) -> Result<Vec<OwnedValue>> {
-        let inner = self.inner.read().expect("dataframe lock poisoned");
-        let words = self.encoder.words().read().expect("word store lock poisoned");
+        let inner = self.inner.read().or_poisoned()?;
+        let words = self.encoder.words().read().or_poisoned()?;
         (0..self.schema.len()).map(|column| self.value_at(&inner, &words, row, column)).collect()
     }
 
     /// Reads one value.
     pub fn value(&self, row: u64, column: usize) -> Result<OwnedValue> {
-        let inner = self.inner.read().expect("dataframe lock poisoned");
-        let words = self.encoder.words().read().expect("word store lock poisoned");
+        let inner = self.inner.read().or_poisoned()?;
+        let words = self.encoder.words().read().or_poisoned()?;
         self.value_at(&inner, &words, row, column)
     }
 
     /// Writes the text of a string cell into `out` without allocating a `String`. Returns `false` for null.
     pub fn write_string(&self, row: u64, column: usize, out: &mut BytesMut) -> Result<bool> {
-        let inner = self.inner.read().expect("dataframe lock poisoned");
-        let words: std::sync::RwLockReadGuard<'_, WordStore<H>> = self.encoder.words().read().expect("word store lock poisoned");
+        let inner = self.inner.read().or_poisoned()?;
+        let words: std::sync::RwLockReadGuard<'_, WordStore<H>> = self.encoder.words().read().or_poisoned()?;
         let col = self.check(&inner, row, column)?;
         if col.ty != ColumnType::String {
             return Err(Error::TypeMismatch { column: col.name.clone() });
@@ -281,23 +282,23 @@ impl<H: Heap> DataFrame<H> {
 
     /// Size of the row heap in bytes.
     pub fn row_heap_len(&self) -> u64 {
-        self.inner.read().expect("dataframe lock poisoned").row_heap.len() as u64
+        self.inner.read().ignore_poison().row_heap.len() as u64
     }
 
     /// A copy of the row heap (for measuring tools).
     pub fn row_heap_snapshot(&self) -> Vec<u8> {
-        self.inner.read().expect("dataframe lock poisoned").row_heap.to_vec()
+        self.inner.read().ignore_poison().row_heap.to_vec()
     }
 
     /// Entries in the whole-string dedup map.
     pub fn dedup_len(&self) -> usize {
-        self.inner.read().expect("dataframe lock poisoned").dedup.len()
+        self.inner.read().ignore_poison().dedup.len()
     }
 
     /// Runs `f` on the buffered rows under the buffer lock (writing a segment, a query or an index over the buffer). Take
     /// it before the word store: see `query::BufferSource`.
     pub(crate) fn with_inner<R>(&self, f: impl FnOnce(&Inner) -> R) -> R {
-        f(&self.inner.read().expect("dataframe lock poisoned"))
+        f(&self.inner.read().ignore_poison())
     }
 
     fn check(&self, inner: &Inner, row: u64, column: usize) -> Result<&Column> {

@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-11-27
+
+Locking fixes (DESIGN.md decisions 122 and 124 to 133). The formats are unchanged.
+
+### Changed
+
+- The writer lock is a POSIX record lock on Unix (`fcntl`) and `LockFileEx` on Windows, with a table of the locks the
+  process holds. A child process never holds it, and it goes when the process ends. **Stop writers of 0.2.1 or older
+  before upgrading:** on Linux their `flock` lock and the new lock do not see each other.
+- A commit no longer holds up `push_row`: it takes the pending rows over in a moment, then compresses and writes them
+  while rows go on into the next buffer (a push waited 4.9 s behind a 100,000-row commit; now about 1.8 million rows go
+  in meanwhile). Reads in the writer's process are not held up either. Call `commit_if_due` from a thread of its own to
+  get this; it returns `None` while another thread commits.
+- `Frame::pending_rows`, `Store::pending_rows` and the pending bytes count the rows of a commit under way.
+- A panic inside the crate while it holds a lock now turns later calls into `Error::Corrupt`, not into more panics.
+
+### Fixed
+
+- A `Frame` kept after its `Store` was dropped could still push rows while another writer had opened the folder,
+  corrupting the pending files. It now gets `Error::ReadOnly`.
+- A copy of a store (or a restored backup) sharing a `pending_dir` with its original took the original's pending rows,
+  and both wrote the same files. A writer now locks its pending files there; a copy opens with none
+  (`pending_files_missing`) and gets an id of its own. A moved store keeps its pending rows.
+- A read-only store that read the manifest just before a commit could stop following the writer until reopened.
+- A commit that failed after the manifest was written could leave memory and disk out of step. Everything that can
+  fail now happens before; a commit that fails after taking the rows over keeps them readable and is finished by the
+  next commit (or the next writable open after a crash).
+- `Store::create` could truncate the heap of a store created at the same moment by another process.
+- `seal` now releases the writer lock, so `Store::build_indexes` runs on the folder while the sealed store is still open.
+
 ## [0.2.1] - 2026-11-27
 
 ### Fixed

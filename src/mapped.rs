@@ -20,6 +20,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 use crate::error::{Error, Result};
+use crate::sync::Unpoison;
 use memmap2::{MmapOptions, MmapRaw};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -316,9 +317,9 @@ impl Region {
         };
         let len = region.refresh()?;
         if writable {
-            let counted = region.chunks.read().expect("chunk list lock poisoned").len();
+            let counted = region.chunks.read().or_poisoned()?.len();
             remove_chunk_files(base, counted)?;
-            *region.cursor.lock().expect("cursor lock poisoned") = len;
+            *region.cursor.lock().or_poisoned()? = len;
         }
         Ok(region)
     }
@@ -330,12 +331,12 @@ impl Region {
 
     /// Writer: the length written so far, published or not.
     pub(crate) fn written_len(&self) -> u64 {
-        *self.cursor.lock().expect("cursor lock poisoned")
+        *self.cursor.lock().ignore_poison()
     }
 
     /// Number of mapped chunks (the writer counts unpublished ones too).
     pub(crate) fn chunk_count(&self) -> usize {
-        self.chunks.read().expect("chunk list lock poisoned").len()
+        self.chunks.read().ignore_poison().len()
     }
 
     /// Loads the published length and maps any newly published chunks. Returns the published length; slices up to it
@@ -344,10 +345,10 @@ impl Region {
         // The writer stores the chunk count before the length, so a count loaded after the length covers it.
         let len = self.counters.load(self.len_slot);
         let count = usize::try_from(self.counters.load(self.chunks_slot)).map_err(|_| Error::Corrupt("chunk count"))?;
-        if self.chunks.read().expect("chunk list lock poisoned").len() >= count {
+        if self.chunks.read().or_poisoned()?.len() >= count {
             return Ok(len);
         }
-        let mut chunks = self.chunks.write().expect("chunk list lock poisoned");
+        let mut chunks = self.chunks.write().or_poisoned()?;
         while chunks.len() < count {
             let chunk = self.map_chunk(chunks.len())?;
             let ordered = match chunks.last() {
@@ -409,14 +410,14 @@ impl Region {
     /// offset. The bytes never cross a chunk.
     pub(crate) fn append(&self, bytes: &[u8]) -> Result<u64> {
         assert!(self.writable, "append to a read-only region");
-        let mut cursor = self.cursor.lock().expect("cursor lock poisoned");
+        let mut cursor = self.cursor.lock().or_poisoned()?;
         let offset = *cursor;
         if bytes.is_empty() {
             return Ok(offset);
         }
         let len = bytes.len() as u64;
         let chunk = {
-            let mut chunks = self.chunks.write().expect("chunk list lock poisoned");
+            let mut chunks = self.chunks.write().or_poisoned()?;
             match chunks.last() {
                 // every chunk starts at or before the cursor (rollback removes the others)
                 Some(last) if offset - last.start + len <= last.capacity => last.clone(),
@@ -435,8 +436,8 @@ impl Region {
     /// Writer: publishes everything written so far (the chunk count, then the length).
     pub(crate) fn publish(&self) {
         assert!(self.writable, "publish on a read-only region");
-        let cursor = self.cursor.lock().expect("cursor lock poisoned");
-        let count = self.chunks.read().expect("chunk list lock poisoned").len();
+        let cursor = self.cursor.lock().ignore_poison();
+        let count = self.chunks.read().ignore_poison().len();
         self.counters.store(self.chunks_slot, count as u64);
         self.counters.store(self.len_slot, *cursor);
     }
@@ -444,10 +445,10 @@ impl Region {
     /// Writer: forgets everything written since the last publish and deletes the chunk files created for it.
     pub(crate) fn rollback(&self) -> Result<()> {
         assert!(self.writable, "rollback on a read-only region");
-        let mut cursor = self.cursor.lock().expect("cursor lock poisoned");
+        let mut cursor = self.cursor.lock().or_poisoned()?;
         *cursor = self.counters.load(self.len_slot);
         let counted = self.counters.load(self.chunks_slot) as usize;
-        let mut chunks = self.chunks.write().expect("chunk list lock poisoned");
+        let mut chunks = self.chunks.write().or_poisoned()?;
         if chunks.len() > counted {
             // Unpublished chunks are only referenced here: unmap them before deleting (required on Windows).
             chunks.truncate(counted);
@@ -460,12 +461,12 @@ impl Region {
     /// may reuse an entry written earlier in the same row).
     pub(crate) fn written_eq(&self, offset: u64, bytes: &[u8]) -> bool {
         assert!(self.writable, "written_eq on a read-only region");
-        let cursor = self.cursor.lock().expect("cursor lock poisoned");
+        let cursor = self.cursor.lock().ignore_poison();
         let len = bytes.len() as u64;
         if offset.checked_add(len).is_none_or(|end| end > *cursor) {
             return false;
         }
-        let chunks = self.chunks.read().expect("chunk list lock poisoned");
+        let chunks = self.chunks.read().ignore_poison();
         let index = chunks.partition_point(|c| c.start <= offset);
         let Some(chunk) = index.checked_sub(1).map(|i| &chunks[i]) else { return false };
         let end = chunks.get(index).map_or(u64::MAX, |c| c.start).min(chunk.end());
@@ -484,7 +485,7 @@ impl Region {
         // The chunk count is loaded after the length, so it covers every published byte (see `refresh`).
         let limit = limit.min(self.published_len());
         let counted = self.counters.load(self.chunks_slot) as usize;
-        let chunks = self.chunks.read().expect("chunk list lock poisoned");
+        let chunks = self.chunks.read().ignore_poison();
         // A reader that has not refreshed may have fewer chunks mapped: then the view ends where they end.
         let chunks: Vec<Arc<Chunk>> = chunks.iter().take(counted).cloned().collect();
         let limit = match chunks.last() {
@@ -497,7 +498,7 @@ impl Region {
     /// The chunk holding `offset` and the logical end of the readable bytes in it (at most `limit`).
     fn locate(&self, offset: u64, limit: u64) -> Result<(Arc<Chunk>, u64)> {
         let limit = limit.min(self.published_len());
-        let chunks = self.chunks.read().expect("chunk list lock poisoned");
+        let chunks = self.chunks.read().or_poisoned()?;
         let index = chunks.partition_point(|c| c.start <= offset);
         let chunk = index.checked_sub(1).map(|i| &chunks[i]).ok_or(Error::Corrupt("mapped offset"))?;
         let next = chunks.get(index).map_or(u64::MAX, |c| c.start);

@@ -59,7 +59,9 @@ This is a library. A server or web app calls it; neither is part of this crate.
   commits by itself: every read and query first checks a few shared counters. Row numbers stay the same when rows move
   from the pending buffer into a segment, and a running search keeps the snapshot it started with.
 - **Commit policy.** `commit_if_due` commits when a dataframe reaches `segment_rows` pending rows, when the pending rows
-  take `commit_policy.max_bytes`, or when the oldest one is `commit_policy.max_age` old.
+  take `commit_policy.max_bytes`, or when the oldest one is `commit_policy.max_age` old. A commit takes the pending rows
+  over in a moment and writes them without holding up `push_row`: call `commit_if_due` from a thread of its own and
+  inserts go on while it compresses.
 - **Integrity.** `Store::verify` checks every checksum; corrupt data returns `Error::Corrupt`, never a panic.
 - **Safe Rust.** `#![deny(unsafe_code)]`; `unsafe` is confined to memory mapping in `filebytes.rs` and `mapped.rs`
   (feature `mmap`), with the rules that make it sound written at the top of `mapped.rs`.
@@ -278,7 +280,10 @@ entropy thresholds) are in [DESIGN.md](DESIGN.md), section 13. Reproduce with
 
 ## Limits and semantics
 
-- One writer per folder. A second writer fails with `Error::Locked`.
+- One writer per folder. A second writer, in this process or another, fails with `Error::Locked`. The lock is a POSIX
+  record lock on Unix (since 0.2.2; earlier versions used `flock`, which does not see it: stop older writers before
+  upgrading) and `LockFileEx` on Windows. A `Frame` whose `Store` was dropped can no longer write (`Error::ReadOnly`).
+- Local file systems only (or tmpfs): not NFS or other network file systems, for the folder and the `pending_dir`.
 - The dictionary is bounded (64 MiB, about 2 million words). When full, `push_row` fails with `Error::DictionaryFull`
   and no row is half-written: seal this folder and create a new one.
 - Search is on symbols, not substrings. Use `word`, `phrase` and `equals`; there is no substring or regex search.
@@ -292,7 +297,10 @@ entropy thresholds) are in [DESIGN.md](DESIGN.md), section 13. Reproduce with
 - Pending rows (`PendingMode::Mapped`) survive a crash of the writer process, not a power loss or kernel crash. A read-only
   store follows a writer only in that mode; with `PendingMode::Memory` it sees what was committed when it was opened.
 - Opening a store with another `pending` mode or `pending_dir` than it was written with commits its pending rows (one
-  small segment) and switches.
+  small segment) and switches. A copy of a folder (or a restored backup) that shares a `pending_dir` with its original
+  does not take the original's pending rows: it opens with none (`recovery().pending_files_missing`).
+- A panic inside the crate while it holds a lock (a bug) turns later calls into `Error::Corrupt` errors, not panics: open
+  the store again.
 - Text types are validated: out-of-range numbers, bad dates and over-precise times are errors.
 
 ## MSRV

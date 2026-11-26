@@ -5,7 +5,7 @@
 //! folder), are named after the store id and the epoch number:
 //!
 //! ```text
-//! p-<store id>-<epoch>.hdr               counters: superseded_by, words region
+//! p-<store id>-<epoch>.hdr               counters: superseded_by, words region, next epoch
 //! p-<store id>-<epoch>.words.<nnnn>      words added to the heap since the last commit
 //! p-<store id>-<epoch>.f<id>.ctr         counters of frame <id>: cells and row-heap regions, first push time
 //! p-<store id>-<epoch>.f<id>.cells.<nnnn> row-major cells and null bits
@@ -22,6 +22,7 @@ use crate::mapped::{CounterFile, Region, RegionView};
 use crate::query::RowSource;
 use crate::schema::Schema;
 use crate::segment::SegmentInput;
+use crate::sync::Unpoison;
 use crate::types::Value;
 use crate::varint;
 use crate::words::{SharedWords, WordStore};
@@ -37,6 +38,8 @@ use std::sync::{Arc, Mutex};
 const SUPERSEDED: usize = 0;
 const WORDS_LEN: usize = 1;
 const WORDS_CHUNKS: usize = 2;
+/// The epoch that receives the new rows while this one is being committed (DESIGN.md 14.17), or 0.
+const NEXT: usize = 3;
 const HEADER_SLOTS: usize = 8;
 /// `superseded_by` of an epoch that ended because the store was sealed.
 pub(crate) const SEALED: u64 = u64::MAX;
@@ -91,18 +94,19 @@ fn epochs_in(dir: &Path, store_id: u128) -> Result<Vec<u64>> {
     Ok(epochs)
 }
 
-/// Deletes the pending files of `store_id` in `dir`, except those of epoch `keep`. Before an older epoch's files are
-/// deleted, its header gets `superseded_by = superseded` if it has none yet (a commit interrupted after the manifest was
-/// written), so readers still on it move on. Files that cannot be deleted (on Windows, while a reader maps them) stay and
-/// are retried at the next call. Returns whether every file was deleted.
-pub(crate) fn remove_other_epochs(dir: &Path, store_id: u128, keep: Option<u64>, superseded: u64) -> Result<bool> {
+/// Deletes the pending files of `store_id` in `dir`, except those of the epochs in `keep`. Before an epoch older than all
+/// of `keep` is deleted, its header gets `superseded_by = superseded` if it has none yet (a commit interrupted after the
+/// manifest was written), so readers still on it move on. Files that cannot be deleted (on Windows, while a reader maps
+/// them) stay and are retried at the next call. Returns whether every file was deleted.
+pub(crate) fn remove_other_epochs(dir: &Path, store_id: u128, keep: &[u64], superseded: u64) -> Result<bool> {
     let mut complete = true;
+    let oldest_kept = keep.iter().copied().min();
     for epoch in epochs_in(dir, store_id)? {
-        if Some(epoch) == keep {
+        if keep.contains(&epoch) {
             continue;
         }
         let prefix = epoch_prefix(store_id, epoch);
-        if keep.is_some_and(|keep| epoch < keep) {
+        if oldest_kept.is_some_and(|kept| epoch < kept) {
             if let Ok(header) = CounterFile::open(&dir.join(format!("{prefix}.hdr")), true) {
                 if header.load(SUPERSEDED) == 0 {
                     header.store(SUPERSEDED, superseded);
@@ -246,9 +250,20 @@ impl Epoch {
         self.header.store(SUPERSEDED, next);
     }
 
+    /// The epoch that takes the new rows while this one is committed, or 0 (DESIGN.md 14.17). Once it is set, this
+    /// epoch gets no more rows or words.
+    pub(crate) fn next(&self) -> u64 {
+        self.header.load(NEXT)
+    }
+
+    /// Writer: links the next epoch (created before), after the last row of this one.
+    pub(crate) fn set_next(&self, next: u64) {
+        self.header.store(NEXT, next);
+    }
+
     /// Writer: appends the words of `words` that are not in the region yet (unpublished until [`Epoch::publish_words`]).
     fn mirror_words(&self, words: &WordStore) -> Result<()> {
-        let mut progress = self.progress.lock().expect("words progress lock poisoned");
+        let mut progress = self.progress.lock().or_poisoned()?;
         let mut buf = BytesMut::new();
         while self.base_words + progress.written < words.word_count() {
             let word = words.get(self.base_words + progress.written).ok_or(Error::Corrupt("missing word"))?;
@@ -262,27 +277,27 @@ impl Epoch {
     }
 
     fn publish_words(&self) {
-        let mut progress = self.progress.lock().expect("words progress lock poisoned");
+        let mut progress = self.progress.lock().ignore_poison();
         self.words.publish();
         progress.published = progress.written;
         progress.loaded_bytes = self.words.written_len();
     }
 
     fn rollback_words(&self) -> Result<()> {
-        let mut progress = self.progress.lock().expect("words progress lock poisoned");
+        let mut progress = self.progress.lock().or_poisoned()?;
         progress.written = progress.published;
         self.words.rollback()
     }
 
     /// Whether the region has published words that were not loaded yet (a cheap check before taking the word store).
     pub(crate) fn has_new_words(&self) -> bool {
-        self.words.published_len() > self.progress.lock().expect("words progress lock poisoned").loaded_bytes
+        self.words.published_len() > self.progress.lock().ignore_poison().loaded_bytes
     }
 
     /// Adds the published words that are not in `words` yet, with the ordinals the writer gave them (readers, and the
     /// writer when it recovers). `words` must hold exactly the words before them.
     pub(crate) fn load_words(&self, words: &mut WordStore) -> Result<()> {
-        let mut progress = self.progress.lock().expect("words progress lock poisoned");
+        let mut progress = self.progress.lock().or_poisoned()?;
         let len = self.words.refresh()?;
         if progress.loaded_bytes >= len {
             return Ok(());
@@ -461,7 +476,7 @@ impl MappedFrame {
 
     /// Writer: a source over every row with the row-heap block starts, to write a segment from.
     pub(crate) fn segment_source(&self) -> Result<MappedSource> {
-        let writer = self.writer.as_ref().ok_or(Error::ReadOnly)?.lock().expect("pending writer lock poisoned");
+        let writer = self.writer.as_ref().ok_or(Error::ReadOnly)?.lock().or_poisoned()?;
         let rows = self.published_rows()?;
         let mut source = self.source(rows)?;
         source.block_starts = writer.state.block_starts.clone();
@@ -471,9 +486,9 @@ impl MappedFrame {
     /// Appends a row and publishes it; returns its number in this buffer. On an error nothing is published and every
     /// in-memory structure is as before (the row is atomic, as in [`crate::DataFrame::push_row`]).
     pub(crate) fn push_row(&self, row: &[Value<'_>]) -> Result<u64> {
-        let mut guard = self.writer.as_ref().ok_or(Error::ReadOnly)?.lock().expect("pending writer lock poisoned");
+        let mut guard = self.writer.as_ref().ok_or(Error::ReadOnly)?.lock().or_poisoned()?;
         let FrameWriter { encoder, state, entries, prepared, row: bytes } = &mut *guard;
-        let mut words = encoder.words().write().expect("word store lock poisoned");
+        let mut words = encoder.words().write().or_poisoned()?;
         let checkpoint = words.checkpoint();
         encoder.prepare_row(&mut words, row, entries, prepared)?;
         let blocks = state.block_starts.len();

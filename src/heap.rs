@@ -39,6 +39,11 @@ impl MemHeap {
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
+
+    /// Size in bytes of the first `words` words (all of them if there are fewer).
+    pub(crate) fn byte_len_of(&self, words: u32) -> u64 {
+        self.offsets.get(words as usize).map_or(self.data.len(), |&start| start as usize) as u64
+    }
 }
 
 impl Heap for MemHeap {

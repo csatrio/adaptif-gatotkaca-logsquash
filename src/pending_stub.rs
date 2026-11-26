@@ -27,7 +27,7 @@ pub(crate) fn now_unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
-pub(crate) fn remove_other_epochs(_: &Path, _: u128, _: Option<u64>, _: u64) -> Result<bool> {
+pub(crate) fn remove_other_epochs(_: &Path, _: u128, _: &[u64], _: u64) -> Result<bool> {
     Ok(true)
 }
 
@@ -61,6 +61,14 @@ impl Epoch {
     }
 
     pub(crate) fn superseded_by(&self) -> u64 {
+        match *self {}
+    }
+
+    pub(crate) fn next(&self) -> u64 {
+        match *self {}
+    }
+
+    pub(crate) fn set_next(&self, _: u64) {
         match *self {}
     }
 

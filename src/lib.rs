@@ -19,6 +19,10 @@ pub mod error;
 pub(crate) mod filebytes;
 pub mod heap;
 pub(crate) mod index;
+pub(crate) mod lock;
+// fs4 locks files on Windows and reserves the space of mapped chunks; a Unix build without `mmap` needs neither
+#[cfg(all(unix, not(feature = "mmap")))]
+use fs4 as _;
 #[cfg(feature = "mmap")]
 pub(crate) mod mapped;
 #[cfg(feature = "mmap")]
@@ -31,6 +35,7 @@ pub mod schema;
 pub(crate) mod segment;
 pub mod splitter;
 pub mod store;
+pub(crate) mod sync;
 pub mod tokenizer;
 pub mod types;
 pub mod varint;

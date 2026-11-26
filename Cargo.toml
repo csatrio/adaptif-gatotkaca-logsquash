@@ -1,6 +1,6 @@
 [package]
 name = "adaptif-gatotkaca-logsquash"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.85"
 authors = ["PT Adaptif Sinergi Dinamis"]
@@ -25,6 +25,9 @@ serde = { version = "1.0.229", features = ["derive"], optional = true }
 serde_json = { version = "1.0.154", optional = true }
 xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 zstd = "0.14.4"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", features = ["fs"] }
 
 [dev-dependencies]
 criterion = "0.7.0"

@@ -21,17 +21,20 @@ see the whole flow.
 ## 2. Golden rules
 
 1. **One writer per folder.** A second `Store::create`/`open` for writing fails with `Error::Locked`. Share one
-   `Arc<Store>`/`Arc<Frame>` between threads instead; `push_row` and `commit` are serialized for you, and searches and
+   `Arc<Store>`/`Arc<Frame>` between threads instead; `push_row` and `commit` are made safe for you, and searches and
    reads may run on other threads at the same time (use 0.1.1 or later: 0.1.0 could deadlock a search of uncommitted
-   rows against a concurrent `push_row`).
+   rows against a concurrent `push_row`). Keep the `Store` alive as long as its frames write: a frame whose store was
+   dropped gets `Error::ReadOnly`. Upgrading from 0.2.1 or older: stop the old writers first (0.2.2 locks differently).
 2. **`seal` at the end of the period, and `commit` before you stop when you can.** With the default
    `PendingMode::Mapped`, pending rows survive a process crash and are recovered by the next `Store::open`
    (`store.recovery()` tells how many), but not a power loss or kernel crash; with `PendingMode::Memory` they are lost on
    exit. `seal` finishes the indexes and the word table and closes the store for writing.
-3. **Call `commit_if_due()` regularly while writing** (for example every 1,000 rows, and from a timer if you set
-   `commit_policy.max_age`). It commits at `segment_rows` (100,000) rows in a frame, at `commit_policy.max_bytes`
-   (256 MiB) of pending rows, or when the oldest pending row is `max_age` old. Never commit after every row: each commit
-   writes a segment and tiny segments compress badly; the mapped pending buffer is what keeps rows safe in between.
+3. **Call `commit_if_due()` regularly while writing**, best from a thread of its own (for example every second; see the
+   recipe). It commits at `segment_rows` (100,000) rows in a frame, at `commit_policy.max_bytes` (256 MiB) of pending
+   rows, or when the oldest pending row is `max_age` old. A commit takes seconds to compress, but `push_row` on other
+   threads waits only for the moment it takes the rows over (0.2.2), so ingest never stalls; called inline from the push
+   loop, the loop waits for the commit. Never commit after every row: each commit writes a segment and tiny segments
+   compress badly; the mapped pending buffer is what keeps rows safe in between.
 4. **Flag the columns you will search, at schema time.** `index_words()` for word/phrase, `case_insensitive()` for
    `word_ci`, `index_equality()` for `equals`. Without a flag the search still works but scans the column.
 5. **Put separate log sources into separate columns**, one wide frame is fine; nulls cost almost nothing. Use real types
@@ -42,7 +45,9 @@ see the whole flow.
    (for example `<root>/2026-11-21-b`) and retry the row there.
 8. **Do not mix `Value` types with the schema.** `push_row` takes one `Value` per column in column order and fails with
    `Error::TypeMismatch`, `ColumnCount`, `ValueOutOfRange` otherwise. It is atomic: a failed row stores nothing.
-9. **Do not delete or edit files in the folder by hand.** Commit points are atomic renames of `manifest`.
+9. **Do not delete or edit files in the folder by hand.** Commit points are atomic renames of `manifest`. Do not open
+   the `lock` file either: on Unix, closing any handle of it releases the writer lock of the whole process.
+10. **Local file systems only** (or tmpfs) for the folder and the `pending_dir`: not NFS or other network file systems.
 
 ## 3. Recipes
 
@@ -59,17 +64,33 @@ let schema = Schema::new(vec![
 let store = Store::create(root.join("2026-11-21"), StoreOptions::default())?;
 let logs = store.create_frame("logs", schema.clone())?;
 
+let store = std::sync::Arc::new(store);
+let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+// Commits run here, so the push loop never waits for one.
+let committer = {
+    let (store, stop) = (store.clone(), stop.clone());
+    std::thread::spawn(move || -> Result<(), Error> {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            store.commit_if_due()?;
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        Ok(())
+    })
+};
 for (ts, level, line) in incoming {
     match logs.push_row(&[Value::TimestampMs(ts), Value::Str(&level), Value::Str(&line)]) {
         Ok(_) => {}
         Err(Error::DictionaryFull | Error::HeapFull) => { /* seal, open the next folder, retry the row */ }
         Err(e) => return Err(e.into()),
     }
-    store.commit_if_due()?;
 }
+stop.store(true, std::sync::atomic::Ordering::Relaxed);
+committer.join().unwrap()?;
 store.commit()?;
 store.seal()?; // at midnight
 ```
+
+Single-threaded code can call `store.commit_if_due()?` in the loop instead; the loop then waits while a commit writes.
 
 To reopen a folder for more writing (same day, after a restart or a crash): `Store::open(path, options)`, then
 `store.frame("logs")`. The dictionary is rebuilt from the heap, and pending rows left by the previous process are
@@ -130,7 +151,7 @@ folder size.
 | Fast ingest | `indexing: false`, `zstd_level: 3..9` (larger files), build indexes afterwards |
 | Less memory per reader | lower `cache_bytes` (32 MiB per segment by default) |
 | Index files read with mmap | `compress_indexes: false` (bigger index files, no decompress on open) |
-| Pending rows off the disk | `pending_dir: Some("/dev/shm/logs".into())` (no disk writeback; pending rows lost on reboot) |
+| Pending rows off the disk | `pending_dir: Some("/dev/shm/logs".into())` (no disk writeback; pending rows lost on reboot; a copy of a folder does not take its original's pending rows) |
 | 0.1 behaviour, fastest push | `pending: PendingMode::Memory` (pending rows lost on exit; readers see commits only) |
 | Commit by age or size | `commit_policy: CommitPolicy { max_bytes, max_age: Some(Duration::from_secs(600)) }` |
 
@@ -166,7 +187,8 @@ showed no useful gain. Details: DESIGN.md section 13.
 ## 7. Errors
 
 `Error` variants worth handling: `Locked` (another writer), `DictionaryFull`/`HeapFull` (rotate), `Corrupt`
-(bad checksum or truncated file: report the folder, do not retry), `UnsupportedVersion`, `TypeMismatch`,
+(bad checksum or truncated file: report the folder, do not retry; also after a panic inside the crate poisoned a lock:
+open the store again), `UnsupportedVersion`, `TypeMismatch`,
 `ColumnCount`, `ValueOutOfRange`, `DateParse { column, reason }`, `RowOutOfRange`, `InvalidQuery`, `ReadOnly`
 (writing to a read-only store), `UnknownFrame`, `FrameExists`, `Io`.
 

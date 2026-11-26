@@ -91,7 +91,7 @@ Because the Dictionary stores only hashes, a hit is verified against the heap by
 ### 5.4 Locking
 The Heap and Dictionary live together behind one `RwLock` inside a `Store` (one folder), shared as `Arc<Store>`.
 - Lookups and hydration take the read lock; inserting a new word takes the write lock after a read-locked miss, re-checking under the write lock.
-- **One writer at a time per folder.** A single `Store` write mutex serializes everything that writes: `push_row` on any dataframe, `create_frame` and `commit`. So a commit never overlaps an insert, and a folder is written by one thread at a time (and one process at a time, through the writer file lock). Reads (`row`, `search`, ...) do not take the mutex and run in parallel with each other and with a writer. Lock order is: write mutex, then dataframe lock, then (v2) the mapped writer mutex of the dataframe, then the word store lock. The epoch pointer of a store is taken after the word store (14.7). The segment file pool lock (7) is a leaf: it may be taken under the locks above, but no lock is taken while it is held, and it is never taken while a segment file or block cache lock is held.
+- **One writer at a time per folder.** A single `Store` write mutex serializes everything that changes the pending rows: `push_row` on any dataframe, `create_frame`, and the freeze of a commit (14.17). A commit lock serializes commits and `create_frame` (the writers of the manifest); since 0.2.2 a commit writes its segments without the write mutex, so inserts go on meanwhile. A folder is written by one process at a time, through the writer file lock (decision 122). Reads (`row`, `search`, ...) take neither and run in parallel with each other and with a writer. Lock order is: commit lock, then write mutex, then the committed state, then the frame list, then a dataframe lock, then (v2) the mapped writer mutex of the dataframe, then the word store lock. The epochs of a store are taken after the word store (14.7), and never together with a dataframe lock. The segment file pool lock (7) is a leaf: it may be taken under the locks above, but no lock is taken while it is held, and it is never taken while a segment file or block cache lock is held.
 - Insert throughput is not a goal, so there is no sharding or per-row batching.
 
 ## 6. Dataframe
@@ -317,13 +317,23 @@ A store is a **folder** covering one day or other time period. All its dataframe
 | 114 | v2 `create_frame`? | Writes the manifest at once (no rows), so readers know the schema and frame ids are stable in pending file names. |
 | 115 | v2 without `mmap`? | `PendingMode::Mapped` falls back to `Memory`. A writer that opens a store whose manifest names a mapped epoch fails with `Error::Io` (`Unsupported`) instead of dropping its pending rows; a reader sees the committed rows. |
 | 116 | v2 readers of a `Memory` writer? | Not followed (no epoch header to watch); they reopen to see new commits, as in v1. |
-| 117 | v2 missing pending files? | A writer starts an empty epoch with the same number and reports `pending_files_missing`. A reader with no header checks for it at each query (one `stat`), so it follows a writer that restarts. |
+| 117 | v2 missing pending files? | A writer starts an empty epoch with the same number and reports `pending_files_missing`. A reader with no header checks for it at each query (one `stat`) and, since 0.2.2, whether the manifest names another epoch (one small read; only in this state), so it follows a writer that restarts or commits (decision 128). |
 | 118 | v2 mode or directory change? | A writable open with another `pending` mode or `pending_dir` than the manifest recovers the pending rows and commits them (one small segment), then uses the new setting. A format 1 store is upgraded the same way. |
 | 119 | v2 old epoch files? | Deleted after each commit and at each writable open, by store id; files that cannot be deleted (Windows, a reader still maps them) are retried at the next commit or open. A header of an older epoch gets `superseded_by` first, so its readers move on. |
 | 120 | v2 store id? | 128 bits from xxh3 of the path, time, process and thread ids; it only has to keep stores apart in a shared `pending_dir`. |
 | 121 | v2 version? | 0.2.0, dated 2026-11-27 in the changelog; not published from here. |
-| 122 | Writer lock and spawned children? | Fixed in 0.2.1: dropping a writable store unlocks the `lock` file explicitly before closing it, only in the process that took the lock. A child forked by another thread shares the locked open file until it executes, so closing alone left the lock held and an immediate reopen failed with `Error::Locked` (781 of 1,000 reopens in the regression test); an unlock through any copy releases it for all. The owner check keeps a forked child that drops an inherited store from releasing its parent's lock. No retry on `Locked` (it would only delay a real second writer), and no switch to per-process `fcntl` locks (closing any handle releases them, and a second open in the same process would no longer be detected). The test-only `TEST_SPAWN_GUARD` is removed. |
+| 122 | Writer lock? | Since 0.2.2, POSIX record locks on Unix (`fcntl(F_SETLK)` on the whole `lock` file, through `rustix`) and `LockFileEx`/`UnlockFile` elsewhere (`fs4`), in `src/lock.rs`. A `flock` lock (0.1 to 0.2.1) is shared with every child process forked while it is held, until the child executes: a store dropped and reopened while another thread spawned a child failed with `Error::Locked` (781 of 1,000 reopens in the regression test), and a long-lived child forked without exec kept the lock after its parent crashed. 0.2.1 unlocked explicitly on drop; POSIX locks belong to the process, so a child never holds one, and they go when the process ends. Their two traps are handled by a process-wide table keyed by device and inode: a second lock of the same file in the process is refused with `Locked` before any handle is opened (POSIX locks of one process never conflict), and the table keeps the only handle the crate opens on a locked file (closing any handle releases every lock of the process on the file); the content of a lock file is read and written through that handle. No retry on `Locked`: it would only delay a real second writer. `flock` and POSIX locks do not see each other on Linux, so a 0.2.0/0.2.1 writer and a 0.2.2 writer can both open a folder: stop older writers before upgrading (CHANGELOG). Readers take no lock. |
 | 123 | CI? | None: the project is built and tested locally only (AGENTS.md). Windows behaviour is covered by tests run there by hand. |
+| 124 | A `Frame` that outlives its `Store`? | Frames hold only a weak reference to the store, so dropping the store released the writer lock while the frame could still push into the mapped files: a second writer then wrote the same files (a row was overwritten in the probe). Since 0.2.2 dropping the store clears the writable flag under the write mutex before the lock is released, and `push_row` checks it again under the mutex: such a frame gets `Error::ReadOnly`. |
+| 125 | A copy of a store in a shared `pending_dir`? | The store id is in the manifest, so a copy (`cp -r`, a restored backup) has the same id and the same pending file names: it took the original's pending rows as its own, and both wrote the same files (and the copy's cleanup deleted the original's). Since 0.2.2 a writer holds `p-<store id>.lock` in a shared `pending_dir` (14.18). It is a copy if another process holds that lock, or if the lock file names another folder that still holds a store with that id; a copy gets no pending rows (`pending_files_missing`) and a new id at once (a switch commit). A store moved to another path takes its pending files over. The in-folder default needs no such lock: a copy has its own files. |
+| 126 | Commit and inserts? | Since 0.2.2 a commit has two steps (14.17). The freeze, under the write mutex, takes the pending buffers over and starts the next epoch; then the words, the segments and the manifest are written without it, so `push_row` and reads go on. 0.2.1 held the write mutex for the whole commit: a push waited 4.9 s behind a 100,000-row commit; now 1.8 million rows are pushed during one, and the slowest push (40 to 80 ms) is no slower than without a commit (chunk growth and page faults). Everything that can fail comes before the manifest rename (the new segments are opened, the seal's `words.idx` is written and opened), so the switch-over after it cannot fail; a failed second step leaves the frozen rows readable and the next commit (or `create_frame`, or a writable open) finishes it first. A seal and a commit that changes the pending mode, directory or store id run whole under the write mutex and are undone if they fail. |
+| 127 | Two `Store::create` on one folder? | The check for an existing manifest is repeated after the writer lock is taken: a create that finished between the first check and the lock would otherwise have its `heap.bin` truncated. |
+| 128 | A reader and an outdated manifest? | A reader that read a manifest just before a commit can find its pending files deleted. 0.2.1 then followed nothing until reopened. Since 0.2.2 `open_read_only` and a reload read the manifest again and start over while it names another epoch (up to 64 times), and a reader without pending files also checks the manifest at each query. A reload does everything that can fail before it changes anything. |
+| 129 | Writer lock after a seal? | Released by the seal, not at the drop: a sealed store takes no more writes, and `Store::build_indexes` (documented to run on a sealed store) failed with `Locked` while the sealing store was alive. |
+| 130 | Word store during the second commit step? | Pushes take the word store for writing. The new words are copied out under a read lock and compressed without it; the index build takes the read lock for one row-heap entry at a time (`WordSource`); the words it needs are older than the frozen rows and never change. Holding it for the whole build stalled pushes for 3 s. The library starts no thread: run `commit_if_due` on a thread of its own to keep inserts going during a commit (AGENTS.md); `commit_if_due` returns `None` while a commit runs on another thread. |
+| 131 | Poisoned locks? | A panic while a lock is held (a bug, running out of memory) can leave the state behind it half-changed. Calls that return a `Result` fail with `Error::Corrupt("a call panicked while it held a lock of this store; open the store again")` instead of panicking in turn (`src/sync.rs`). Calls without a `Result` (counters such as `len`), caches, and switch-overs made of whole assignments take the guard anyway. |
+| 132 | Network file systems? | Not supported: a store and its `pending_dir` must be on a local file system (or tmpfs). Locks may not reach other hosts, and mapped files are not coherent between hosts. |
+| 133 | 0.2.2? | A patch release dated 2026-11-27 with decisions 122 and 124 to 132. Formats unchanged: the epoch header uses a slot that was zero before (`NEXT`, 14.17). |
 | (note) | Folder = period | A folder covers a day or other period and is shared by all its dataframes; on rotation the dictionary is dropped, the heap and indexes stay. |
 
 ## 9. Open Questions
@@ -341,7 +351,8 @@ Library crate (`lib.rs`) with modules: `splitter`, `tokenizer`, `heap`, `diction
 | `chrono` | date/time parsing and formatting (6.2.2) |
 | `bytes` (`BytesMut`) | scratch and in-memory buffers |
 | `memmap2` (feature `mmap`, on by default) | memory-mapped reads of the index files and `words.idx` (Windows, Linux, macOS); compressed blocks use plain file reads (Q93). v2 adds the shared, writable maps of the pending buffer (14.3). All `unsafe` is confined to the `filebytes` and `mapped` modules; the rest of the crate has `#![deny(unsafe_code)]` |
-| `fs4` | advisory file locks |
+| `fs4` | file locks on Windows (`LockFileEx`, decision 122) and the space of mapped chunk files (`allocate`) |
+| `rustix` (Unix) | POSIX record locks (`fcntl(F_SETLK)`) for the writer lock, without `unsafe` (decision 122) |
 | `caseless` | full Unicode case folding |
 | `zstd` | block compression |
 | `base64` | exact base64 detection and round-trip (4.2) |
@@ -478,6 +489,7 @@ The 1 MiB default makes the whole corpus 25.5% of raw with every index (segments
 
 Things the benchmarks make visible: a phrase made of very common words (or single characters) falls back to verifying many rows and takes tens of milliseconds, and a single-character word always scans.
 - **Version 2 done (0.2.0, section 14):** `mapped` (counter files, chunked regions), `pending` (epochs, words mirror, mapped writer, recovery, mapped source), `RowEncoder`, `SegmentInput`, views and live readers in `store`, `CommitPolicy` and `commit_if_due`. 124 tests pass with the default features (5 runs in a row) and 102 without `mmap`; clippy is clean both ways. The push benchmark is in 14.16.
+- **0.2.2 (locking, decisions 122 and 124 to 133):** POSIX writer locks with a process-wide table (`lock`), lock poisoning as errors (`sync`), frames that outlive their store, copies in a shared `pending_dir` (14.18), the two-step commit (14.17), readers that read an outdated manifest, `create` checked under the lock, and the seal releasing the lock. 137 tests pass with the default features (5 runs in a row after the last change) and 111 without `mmap`; clippy is clean both ways. The push cost is unchanged (4.1 µs mapped, 3.2 µs memory, 14.16).
 - Next: nothing is planned; remaining work is whatever the user asks for next.
 
 ## 14. Version 2: Mapped Pending Buffer and Live Readers
@@ -560,7 +572,7 @@ The validation and tokenizing of a row is the crate-internal `RowEncoder`, share
 - **Pending size:** `Frame::pending_bytes()` is the published cells length plus the row-heap length (a memory buffer: rows × columns × 8 plus its row heap). `Store::pending_bytes()` adds the bytes of the words added to the word store since the last commit.
 
 ### 14.6 Commit, seal and epochs
-`commit()` (under the write mutex):
+Since 0.2.2 a commit runs these steps in two parts, so inserts are not held up while it writes (14.17). The steps and the commit point are unchanged:
 1. Append the new words to `heap.bin` and write one segment per frame with pending rows, plus their indexes, exactly as in v1. These are read from the mapped regions.
 2. Create the empty epoch `E+1`: the header and the counter files of every frame. The data chunks are created on first use.
 3. Write the manifest with `epoch = E+1`. This is the commit point, as in v1.
@@ -586,6 +598,8 @@ Each query works on a **view**, taken at its start: the segment list, the pendin
 
 When nothing changed, this costs a few atomic loads.
 
+**During a commit** (14.17) the header of `E` gets `next = E+1` while the writer writes the segments. A reader that sees it loads the remaining words of `E` (frozen, complete), maps `E+1`, and its views get a third tier: segments, then the frozen rows of `E`, then the rows of `E+1`, under the same row numbers. When `E` gets `superseded_by`, the reader re-reads the manifest and keeps `E+1`, whose words it has already loaded.
+
 **Search over pending rows:**
 - A `MappedSource: RowSource` serves the pending rows: `cell` reads the row-major cells, `with_entry` hands out the tail of the chunk, and `range` scans.
 - An in-memory index of the pending rows is built lazily per reader and rebuilt when the row count has grown, like `active_index` in v1. Building it incrementally is future work.
@@ -603,6 +617,7 @@ A writable `Store::open` with a mapped buffer:
    - From that list, rebuild `block_starts` with the push rule, and the dedup map by hashing each entry (up to the cap, 6.4).
 4. Finish an interrupted commit: any older epoch of this store id still present in `pending_dir` (the crash came after the manifest rename) gets `superseded_by` set, so its readers move on, and its files are deleted (retried later on Windows).
 5. Continue appending to `E`. There is no recovery commit, so a restart does not create a small segment.
+5a. Since 0.2.2: if the header of `E` names a `next` epoch (a crash between the two steps of a commit, 14.17), both are opened (the frozen rows of `E`, then the rows of `E+1`) and the commit of `E` is finished at open. If that fails, its rows stay readable and the next commit finishes it.
 6. Opening with `PendingMode::Memory`, or with a different `pending_dir`, while `E` has pending rows commits them first (one small segment), then switches.
 
 **Crash matrix:**
@@ -610,7 +625,8 @@ A writable `Store::open` with a mapped buffer:
 |---|---|
 | `push_row`, before the cells `len` store | The row is absent. Uncounted chunks and `.tmp` files are deleted. Bytes past the published lengths are ignored and overwritten later. |
 | `push_row`, after the cells `len` store | The row is present. |
-| commit, before the manifest rename | As before the commit: the epoch `E` buffer is intact, and the stray segments are removed (7). |
+| commit, before the freeze | As before the commit. |
+| commit, after the freeze, before the manifest rename | The rows of `E` and those pushed into `E+1` meanwhile are recovered; the commit of `E` is finished at open (step 5a), and the stray segments are removed (7). |
 | commit, after the manifest rename | The rows are in the segment. The `E` files are deleted at open, and readers switch at their next query. |
 
 ### 14.9 Commit policy
@@ -679,4 +695,29 @@ All done in 0.2.0.
 - **Disk writeback:** with the default in-folder `pending_dir`, the kernel writes dirty pages to disk about every 30 s. That is extra I/O but no extra syscalls on the write path.
 - **Push cost (measured):** `push_row` into a store costs 4.0 µs per row with the mapped buffer and 3.2 µs with the memory buffer (criterion, 1,000 synthetic rows, chunk creation included). Insert throughput is not a goal (1).
 - **Readers of a `Memory` writer** do not follow it: there is no cheap signal of a new commit without the epoch header (decision 116). They reopen to see new commits, as in v1.
-- **Writer lock and child processes:** fixed in 0.2.1 (decision 122): the writer lock is unlocked explicitly on drop, so a child process spawned by another thread no longer keeps it held after the store is dropped.
+- **Writer lock and child processes:** fixed (decision 122): POSIX locks on Unix since 0.2.2; a child process never holds the writer lock.
+
+### 14.17 Commits that do not stop inserts (0.2.2)
+A commit has two steps (decision 126).
+
+**Freeze**, under the write mutex (milliseconds):
+1. Create the epoch `E+1` in the same directory, with the counter files of every frame, and open its empty buffers.
+2. Store `next = E+1` in the header of `E` (release). No row of `E` is being written (the write mutex is held), so `E` is complete: readers in other processes follow into `E+1` at once (14.7).
+3. Each frame's buffer becomes its `committing` buffer, and the new one takes the next rows. The writer's views have three tiers: segments, the committing rows, the pending rows. Row numbers do not change.
+
+**Finish**, without the write mutex, under the commit lock:
+1. Copy the words added since the last commit (all those before the freeze) under a read lock of the word store, then compress and append them to `heap.bin` without it.
+2. Write one segment per frame from its committing buffer, and its index (the word store is locked for one entry at a time, decision 130), then open the segment. A seal also writes and opens `words.idx`.
+3. Write the manifest (`epoch = E+1`): the commit point.
+4. Switch over (nothing fails here): add the segments, drop the committing buffers, store `superseded_by` in the header of `E`, delete its files.
+
+A failure before step 3 deletes the new segment files and keeps the frozen rows readable; the next commit, `create_frame` or writable open finishes the commit first. A seal, and a commit that changes the pending mode, directory or store id (where readers could not follow through `next`), run both steps under the write mutex and are undone if they fail. `commit_if_due` returns `None` while another thread commits. In memory mode the same two steps run without epochs.
+
+### 14.18 A shared pending directory (0.2.2)
+With a `pending_dir` outside the folder, the pending files of many stores share a directory, told apart by the store id. A writer holds the lock file `p-<store id>.lock` there (a POSIX lock, decision 122), which holds the canonical path of its folder, written through the lock's handle. At a writable open:
+- the lock is held by another process, or by another store of this process: this store is a copy;
+- the lock file names another folder that still holds a store with this id: a copy of a store that is not running;
+- otherwise the pending files are this store's (a moved store takes them over), and the lock file gets this folder's path.
+
+A copy reports `pending_files_missing`, gets no pending rows and a new store id at once. A commit that moves to another directory or id takes the new lock first and releases (and deletes) the old one after; the seal deletes it.
+

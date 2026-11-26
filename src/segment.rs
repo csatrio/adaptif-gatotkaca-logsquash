@@ -15,6 +15,7 @@ use crate::dictionary::xxh3;
 use crate::error::{Error, Result};
 use crate::heap::Heap;
 use crate::schema::Schema;
+use crate::sync::Unpoison;
 use crate::types::OwnedValue;
 use crate::words::WordStore;
 use std::borrow::Cow;
@@ -320,7 +321,7 @@ impl FilePool {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
-        self.state.lock().expect("segment file pool lock poisoned")
+        self.state.lock().ignore_poison()
     }
 
     /// The limit of open files.
@@ -524,7 +525,7 @@ impl SegmentReader {
         {
             // the pool lock is released by now: only the file lock is held while reading
             let handle = self.handle()?;
-            let mut file = handle.file.lock().expect("segment file lock poisoned");
+            let mut file = handle.file.lock().or_poisoned()?;
             file.seek(SeekFrom::Start(block.offset))?;
             file.read_exact(&mut comp)?;
         }
@@ -535,7 +536,7 @@ impl SegmentReader {
     }
 
     fn remember(&self, key: CacheKey, value: Cached, size: usize) {
-        let mut cache = self.cache.lock().expect("segment cache lock poisoned");
+        let mut cache = self.cache.lock().ignore_poison();
         if cache.bytes + size > self.cache_limit {
             cache.map.clear();
             cache.bytes = 0;
@@ -546,7 +547,7 @@ impl SegmentReader {
 
     fn column_data(&self, block: u64, column: u32) -> Result<Arc<ColumnData>> {
         let key = CacheKey::Column { block, column };
-        if let Some(Cached::Column(data)) = self.cache.lock().expect("segment cache lock poisoned").map.get(&key) {
+        if let Some(Cached::Column(data)) = self.cache.lock().or_poisoned()?.map.get(&key) {
             return Ok(Arc::clone(data));
         }
         let entry = &self.index.column_blocks[block as usize * self.index.columns as usize + column as usize];
@@ -572,7 +573,7 @@ impl SegmentReader {
 
     fn heap_block(&self, index: usize) -> Result<Arc<Vec<u8>>> {
         let key = CacheKey::Heap(index);
-        if let Some(Cached::Heap(data)) = self.cache.lock().expect("segment cache lock poisoned").map.get(&key) {
+        if let Some(Cached::Heap(data)) = self.cache.lock().or_poisoned()?.map.get(&key) {
             return Ok(Arc::clone(data));
         }
         let data = Arc::new(self.read_block(&self.index.heap_blocks[index].1)?);

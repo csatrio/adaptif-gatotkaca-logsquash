@@ -19,11 +19,13 @@ use crate::dataframe::{DataFrame, DataFrameOptions, decode_value};
 use crate::dictionary::{Dictionary, xxh3};
 use crate::error::{Error, Result};
 use crate::heap::{Heap, MemHeap};
-use crate::index::{SegmentIndex, WordTable, build_index, compress_index, write_file_atomically};
+use crate::index::{SegmentIndex, WordSource, WordTable, build_index, compress_index, write_file_atomically};
+use crate::lock::FileLock;
 use crate::pending::{ChunkSizes, Epoch, MappedFrame, SEALED, now_unix_ms, remove_epoch, remove_other_epochs};
 use crate::query::{self, BufferSource, Page, PageResult, Prepared, Query, RowSource};
 use crate::schema::{Column, ColumnFlags, Schema};
 use crate::segment::{DEFAULT_MAX_OPEN_SEGMENTS, FilePool, SegmentReader, WriteOptions, write_segment};
+use crate::sync::Unpoison;
 use crate::tokenizer::{TokenizerOptions, decode_with};
 use crate::types::{ColumnType, OwnedValue, Value};
 use crate::varint;
@@ -399,19 +401,20 @@ fn read_heap(path: &Path, committed_bytes: u64, committed_words: u32) -> Result<
     Ok(heap)
 }
 
-/// Writes the words `from..to` as blocks after byte `at` of `heap.bin` (dropping anything after `at`); returns the new length.
-fn append_heap(path: &Path, at: u64, words: &WordStore, from: u32, to: u32, block_bytes: usize, level: i32) -> Result<u64> {
+/// Writes `words` as blocks after byte `at` of `heap.bin` (dropping anything after `at`); returns the new length. The words
+/// are a copy, so a commit compresses them without holding the word store (DESIGN.md 14.17).
+fn append_heap(path: &Path, at: u64, words: &[String], block_bytes: usize, level: i32) -> Result<u64> {
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.set_len(at)?;
     file.seek(SeekFrom::Start(at))?;
     let mut length = at;
-    let mut ordinal = from;
-    while ordinal < to {
+    let mut next = 0;
+    while next < words.len() {
         let mut raw = Writer::new();
         let mut count = 0u32;
-        while ordinal < to && (count == 0 || raw.buf.len() < block_bytes) {
-            raw.str(words.get(ordinal).ok_or(Error::Corrupt("missing word"))?);
-            ordinal += 1;
+        while next < words.len() && (count == 0 || raw.buf.len() < block_bytes) {
+            raw.str(&words[next]);
+            next += 1;
             count += 1;
         }
         let comp = zstd::bulk::compress(&raw.buf, level)?;
@@ -522,9 +525,8 @@ impl Pending {
             Buffer::Memory(frame) => frame.with_inner(|inner| {
                 write_segment(&path, inner, write_options)?;
                 if options.indexing {
-                    // the buffer lock is held: the words after it (see query::BufferSource)
-                    let words = words.read().expect("word store lock poisoned");
-                    write_index(dir, options, schema, &BufferSource::all(inner), &words, file)?;
+                    // the buffer lock is held: the words after it (see query::BufferSource), for one entry at a time
+                    write_index(dir, options, schema, &BufferSource::all(inner), &**words, file)?;
                 }
                 Ok(())
             }),
@@ -532,8 +534,8 @@ impl Pending {
                 let source = frame.segment_source()?;
                 write_segment(&path, &source, write_options)?;
                 if options.indexing {
-                    let words = words.read().expect("word store lock poisoned");
-                    write_index(dir, options, schema, &source, &words, file)?;
+                    // the word store is locked for one entry at a time: inserts go on (DESIGN.md 14.17)
+                    write_index(dir, options, schema, &source, &**words, file)?;
                 }
                 Ok(())
             }
@@ -547,7 +549,7 @@ impl Pending {
             return Ok(None);
         }
         let rows = source.row_count();
-        let mut cache = self.index.lock().expect("index cache lock poisoned");
+        let mut cache = self.index.lock().or_poisoned()?;
         if let Some((cached_rows, index)) = &*cache {
             if *cached_rows == rows {
                 return Ok(Some(Arc::clone(index)));
@@ -589,20 +591,44 @@ struct FrameState {
     segments: Arc<Vec<Arc<Segment>>>,
     committed_rows: u64,
     next_segment: u32,
+    /// The rows of a commit under way (DESIGN.md 14.17): frozen, numbered after the segments and before `pending`.
+    committing: Option<Arc<Pending>>,
     pending: Arc<Pending>,
 }
 
-/// A consistent snapshot of a frame for one read or query: its segments, and its pending buffer up to a row count.
+impl FrameState {
+    fn new(segments: Vec<Arc<Segment>>, committed_rows: u64, next_segment: u32, pending: Pending) -> Self {
+        Self { segments: Arc::new(segments), committed_rows, next_segment, committing: None, pending: Arc::new(pending) }
+    }
+
+    /// The pending buffers, oldest first: the committing one, then the one that takes new rows.
+    fn buffers(&self) -> impl Iterator<Item = &Arc<Pending>> {
+        self.committing.iter().chain(std::iter::once(&self.pending))
+    }
+}
+
+/// A consistent snapshot of a frame for one read or query: its segments, the rows of a commit under way, and its pending
+/// buffer up to a row count.
 #[derive(Clone)]
 struct View {
     segments: Arc<Vec<Arc<Segment>>>,
     committed_rows: u64,
+    committing: Option<(Arc<Pending>, u64)>,
     pending: Arc<Pending>,
     pending_rows: u64,
 }
 
 impl View {
-    /// The committed segment holding `row` and the row's number in it; `None` if `row` is pending or past the end.
+    fn committing_rows(&self) -> u64 {
+        self.committing.as_ref().map_or(0, |(_, rows)| *rows)
+    }
+
+    /// Rows not in a segment yet.
+    fn buffered_rows(&self) -> u64 {
+        self.committing_rows() + self.pending_rows
+    }
+
+    /// The committed segment holding `row` and the row's number in it; `None` if `row` is not committed or past the end.
     fn locate(&self, row: u64) -> Option<(usize, u64)> {
         if row >= self.committed_rows {
             return None;
@@ -611,9 +637,16 @@ impl View {
         Some((i, row - self.segments[i].start))
     }
 
-    /// The number of `row` in the pending buffer.
-    fn pending_row(&self, row: u64) -> Result<u64> {
-        row.checked_sub(self.committed_rows).filter(|&local| local < self.pending_rows).ok_or(Error::RowOutOfRange)
+    /// The buffer holding an uncommitted `row`, its readable rows, and the row's number in it.
+    fn buffer_row(&self, row: u64) -> Result<(&Arc<Pending>, u64, u64)> {
+        let mut local = row.checked_sub(self.committed_rows).ok_or(Error::RowOutOfRange)?;
+        if let Some((buffer, rows)) = &self.committing {
+            if local < *rows {
+                return Ok((buffer, *rows, local));
+            }
+            local -= rows;
+        }
+        if local < self.pending_rows { Ok((&self.pending, self.pending_rows, local)) } else { Err(Error::RowOutOfRange) }
     }
 }
 
@@ -649,11 +682,21 @@ impl Frame {
             shared.refresh()?;
         }
         let view = {
-            let state = self.state.read().expect("frame lock poisoned");
+            let state = self.state.read().or_poisoned()?;
+            let committing = match &state.committing {
+                Some(buffer) => Some((buffer.clone(), buffer.rows()?)),
+                None => None,
+            };
             let pending_rows = state.pending.rows()?;
-            View { segments: state.segments.clone(), committed_rows: state.committed_rows, pending: state.pending.clone(), pending_rows }
+            View {
+                segments: state.segments.clone(),
+                committed_rows: state.committed_rows,
+                committing,
+                pending: state.pending.clone(),
+                pending_rows,
+            }
         };
-        // after the row count: the words of those rows are published before it
+        // after the row counts: the words of those rows are published before them
         if let Some(shared) = &shared {
             shared.load_pending_words()?;
         }
@@ -662,7 +705,7 @@ impl Frame {
 
     /// Number of rows, committed and pending.
     pub fn len(&self) -> u64 {
-        self.view().map_or(0, |v| v.committed_rows + v.pending_rows)
+        self.view().map_or(0, |v| v.committed_rows + v.buffered_rows())
     }
 
     /// Whether there are no rows.
@@ -670,26 +713,39 @@ impl Frame {
         self.len() == 0
     }
 
-    /// Rows pushed since the last commit (the next commit writes them). A read-only store counts the rows the writer
-    /// has published.
+    /// Rows not committed yet: pushed since the last commit, including those of a commit under way. A read-only store
+    /// counts the rows the writer has published.
     pub fn pending_rows(&self) -> u64 {
-        self.view().map_or(0, |v| v.pending_rows)
+        self.view().map_or(0, |v| v.buffered_rows())
     }
 
-    /// Bytes the pending rows of this dataframe take (cells and row heap).
+    /// Bytes the pending rows of this dataframe take (cells and row heap), including those of a commit under way.
     pub fn pending_bytes(&self) -> u64 {
-        self.state.read().expect("frame lock poisoned").pending.pending_bytes()
+        self.state.read().ignore_poison().buffers().map(|b| b.pending_bytes()).sum()
+    }
+
+    /// When the oldest pending row was pushed (Unix milliseconds), or 0 if there is none.
+    fn first_push_ms(&self) -> u64 {
+        let state = self.state.read().ignore_poison();
+        state.buffers().map(|b| b.first_push_ms()).filter(|&ms| ms > 0).min().unwrap_or(0)
     }
 
     /// Appends a row and returns its row number. With [`PendingMode::Mapped`] the row survives a crash of the process
-    /// once this returns; it is in a segment after [`Store::commit`].
+    /// once this returns; it is in a segment after [`Store::commit`]. A commit running on another thread does not hold
+    /// it up, except for the moment it takes the pending rows over. Fails with [`Error::ReadOnly`] if the store is
+    /// read-only, sealed, or was dropped.
     pub fn push_row(&self, row: &[Value<'_>]) -> Result<u64> {
         if !self.writable.load(Ordering::Acquire) {
             return Err(Error::ReadOnly);
         }
-        let _write = self.write_mutex.lock().expect("write mutex poisoned");
-        let state = self.state.read().expect("frame lock poisoned");
-        Ok(state.committed_rows + state.pending.push_row(row)?)
+        let _write = self.write_mutex.lock().or_poisoned()?;
+        // again under the write mutex: dropping the store clears it under the mutex before the writer lock goes
+        if !self.writable.load(Ordering::Acquire) {
+            return Err(Error::ReadOnly);
+        }
+        let state = self.state.read().or_poisoned()?;
+        let before = state.committed_rows + state.committing.as_ref().map_or(Ok(0), |c| c.rows())?;
+        Ok(before + state.pending.push_row(row)?)
     }
 
     /// Reads one row.
@@ -697,13 +753,13 @@ impl Frame {
         let view = self.view()?;
         match view.locate(row) {
             Some((segment, local)) => {
-                let words = self.words.read().expect("word store lock poisoned");
+                let words = self.words.read().or_poisoned()?;
                 view.segments[segment].reader.row(&self.schema, &words, local)
             }
             None => {
-                let local = view.pending_row(row)?;
-                view.pending.with_source(view.pending_rows, |source| {
-                    let words = self.words.read().expect("word store lock poisoned");
+                let (buffer, rows, local) = view.buffer_row(row)?;
+                buffer.with_source(rows, |source| {
+                    let words = self.words.read().or_poisoned()?;
                     let columns = self.schema.columns().iter().enumerate();
                     columns.map(|(i, column)| source_value(source, column, &words, local, i)).collect()
                 })
@@ -716,14 +772,14 @@ impl Frame {
         let view = self.view()?;
         match view.locate(row) {
             Some((segment, local)) => {
-                let words = self.words.read().expect("word store lock poisoned");
+                let words = self.words.read().or_poisoned()?;
                 view.segments[segment].reader.value(&self.schema, &words, local, column)
             }
             None => {
-                let local = view.pending_row(row)?;
+                let (buffer, rows, local) = view.buffer_row(row)?;
                 let col = self.schema.columns().get(column).ok_or(Error::ColumnOutOfRange)?;
-                view.pending.with_source(view.pending_rows, |source| {
-                    let words = self.words.read().expect("word store lock poisoned");
+                buffer.with_source(rows, |source| {
+                    let words = self.words.read().or_poisoned()?;
                     source_value(source, col, &words, local, column)
                 })
             }
@@ -739,17 +795,17 @@ impl Frame {
         let view = self.view()?;
         match view.locate(row) {
             Some((segment, local)) => {
-                let words = self.words.read().expect("word store lock poisoned");
+                let words = self.words.read().or_poisoned()?;
                 view.segments[segment].reader.write_string(&words, local, column, out)
             }
             None => {
-                let local = view.pending_row(row)?;
-                view.pending.with_source(view.pending_rows, |source| {
+                let (buffer, rows, local) = view.buffer_row(row)?;
+                buffer.with_source(rows, |source| {
                     let (cell, null) = source.cell(local, column)?;
                     if null {
                         return Ok(false);
                     }
-                    let words = self.words.read().expect("word store lock poisoned");
+                    let words = self.words.read().or_poisoned()?;
                     source.with_entry(cell, &mut |tail| decode_with(&words, tail, out).map(|_| ()))?;
                     Ok(true)
                 })
@@ -765,7 +821,7 @@ impl Frame {
     }
 
     fn search_in(&self, view: View, query: &Query) -> Result<RowIds<'_>> {
-        let prepared = query::prepare(query, &self.schema, &self.words.read().expect("word store lock poisoned"))?;
+        let prepared = query::prepare(query, &self.schema, &*self.words.read().or_poisoned()?)?;
         Ok(RowIds { frame: self, view, prepared, unit: 0, pending: Vec::new().into_iter(), done: false })
     }
 
@@ -808,34 +864,39 @@ impl Frame {
         let (cell, null) = match view.locate(row) {
             Some((segment, local)) => view.segments[segment].reader.cell(local, column)?,
             None => {
-                let local = view.pending_row(row)?;
-                view.pending.with_source(view.pending_rows, |source| source.cell(local, column))?
+                let (buffer, rows, local) = view.buffer_row(row)?;
+                buffer.with_source(rows, |source| source.cell(local, column))?
             }
         };
         Ok((!null).then_some(cell))
     }
 
-    /// The matches of `prepared` in one unit of `view`: segments in order, then the pending rows. `None` after the last.
+    /// The matches of `prepared` in one unit of `view`: the segments in order, then the rows of a commit under way, then
+    /// the pending rows. `None` after the last.
     fn search_unit(&self, view: &View, prepared: &[Prepared], unit: usize) -> Result<Option<Vec<u64>>> {
         if let Some(segment) = view.segments.get(unit) {
-            let words = self.words.read().expect("word store lock poisoned");
+            let words = self.words.read().or_poisoned()?;
             let rows = query::evaluate(&segment.reader, segment.index.as_ref(), &words, prepared)?;
             return Ok(Some(rows.into_iter().map(|r| segment.start + u64::from(r)).collect()));
         }
-        if unit != view.segments.len() {
-            return Ok(None);
-        }
-        if view.pending_rows == 0 {
+        let (buffer, rows, base) = match unit - view.segments.len() {
+            0 => match &view.committing {
+                Some((buffer, rows)) => (buffer, *rows, view.committed_rows),
+                None => return Ok(Some(Vec::new())),
+            },
+            1 => (&view.pending, view.pending_rows, view.committed_rows + view.committing_rows()),
+            _ => return Ok(None),
+        };
+        if rows == 0 {
             return Ok(Some(Vec::new()));
         }
-        let base = view.committed_rows;
-        let rows = view.pending.with_source(view.pending_rows, |source| {
+        let found = buffer.with_source(rows, |source| {
             // a memory buffer is locked first, then the words (the order of push_row; see query::BufferSource)
-            let words = self.words.read().expect("word store lock poisoned");
-            let index = view.pending.index(source, &self.schema, &words)?;
+            let words = self.words.read().or_poisoned()?;
+            let index = buffer.index(source, &self.schema, &words)?;
             query::evaluate(source, index.as_deref(), &words, prepared)
         })?;
-        Ok(Some(rows.into_iter().map(|r| base + u64::from(r)).collect()))
+        Ok(Some(found.into_iter().map(|r| base + u64::from(r)).collect()))
     }
 
     /// An iterator over all rows in insertion order.
@@ -946,29 +1007,169 @@ impl Committed {
     }
 }
 
+/// The epochs of the mapped pending buffer in use (DESIGN.md 14.17).
+#[derive(Clone, Default)]
+struct Epochs {
+    /// The epoch of a commit under way: frozen, it gets no more rows or words. The manifest still names it.
+    committing: Option<Arc<Epoch>>,
+    /// The epoch that takes new rows.
+    live: Option<Arc<Epoch>>,
+}
+
+impl Epochs {
+    /// The epoch the manifest names.
+    fn base(&self) -> Option<&Arc<Epoch>> {
+        self.committing.as_ref().or(self.live.as_ref())
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Arc<Epoch>> {
+        self.committing.iter().chain(self.live.iter())
+    }
+}
+
+/// A commit whose rows are frozen in the `committing` buffers of the frames (DESIGN.md 14.17), and what its manifest
+/// will say.
+struct Frozen {
+    /// Words the commit puts into the heap: all words when it froze.
+    words: u32,
+    /// Bytes of those words in the word store.
+    word_bytes: u64,
+    /// The epoch the manifest will name.
+    next: u64,
+    store_id: u128,
+    mapped: bool,
+    pending_text: String,
+    seal: bool,
+}
+
+/// How many times a read-only store reads the manifest again when the writer deleted the pending files it names (it
+/// committed again meanwhile). Each try follows a commit, so more are needed only when commits come faster than a
+/// manifest can be read.
+const READER_RETRIES: usize = 64;
+
+/// The lock of the pending files of one store in a shared `pending_dir` (DESIGN.md 14.18): `p-<store id>.lock`, which
+/// holds the canonical path of the store that writes them.
+struct PendingLock {
+    dir: PathBuf,
+    store_id: u128,
+    lock: FileLock,
+}
+
+enum Claim {
+    Ours(PendingLock),
+    /// Another store has the same id: this one is a copy of it (`cp -r`, or a backup restored next to it).
+    Copy,
+}
+
+/// Takes the pending files of `store_id` in `pdir` for the store in `store_dir`, unless they belong to another store
+/// with the same id: one that holds them now, or the one whose path the lock file names if a store with that id is still
+/// there. A store moved to another path (the lock file names a path without that store) takes them over.
+fn claim_pending(pdir: &Path, store_id: u128, store_dir: &Path) -> Result<Claim> {
+    std::fs::create_dir_all(pdir)?;
+    let path = pdir.join(format!("p-{store_id:032x}.lock"));
+    let me = std::fs::canonicalize(store_dir)?.to_string_lossy().into_owned();
+    let lock = match FileLock::try_lock(&path) {
+        Ok(lock) => lock,
+        Err(Error::Locked) => return Ok(Claim::Copy),
+        Err(e) => return Err(e),
+    };
+    let mut owner = String::new();
+    // through the lock's handle: another handle would release the lock when closed (see crate::lock)
+    let mut file = lock.file();
+    file.read_to_string(&mut owner)?;
+    if !owner.is_empty() && owner != me {
+        let still_there = read_manifest(Path::new(&owner)).is_ok_and(|m| m.store_id == store_id);
+        if still_there {
+            return Ok(Claim::Copy);
+        }
+    }
+    if owner != me {
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(me.as_bytes())?;
+        file.sync_all()?;
+    }
+    Ok(Claim::Ours(PendingLock { dir: pdir.to_path_buf(), store_id, lock }))
+}
+
+/// What opening the epochs of a manifest found.
+#[derive(Default)]
+struct OpenedEpochs {
+    epochs: Epochs,
+    /// The manifest names pending files that do not exist.
+    missing: bool,
+    /// During a commit: the words, and their bytes, before the epoch that took the new rows.
+    split: Option<(u32, u64)>,
+}
+
+/// Opens the epoch the manifest names and, while a commit of it is under way, the next one, and loads their words
+/// (DESIGN.md 14.17). `words` holds the heap words.
+fn open_epochs(pdir: &Path, manifest: &Manifest, options: &StoreOptions, words: &mut WordStore, writable: bool) -> Result<OpenedEpochs> {
+    if !manifest.mapped || manifest.sealed {
+        return Ok(OpenedEpochs::default());
+    }
+    let sizes = options.chunk_sizes();
+    let id = manifest.store_id;
+    let Some(base) = Epoch::open(pdir, id, manifest.epoch, manifest.heap_words, sizes, writable)? else {
+        return Ok(OpenedEpochs { missing: true, ..OpenedEpochs::default() });
+    };
+    base.load_words(words)?;
+    let next = base.next();
+    if next != 0 && base.superseded_by() == 0 {
+        let split = (words.word_count(), words.heap().byte_len());
+        let live = match Epoch::open(pdir, id, next, split.0, sizes, writable)? {
+            Some(live) => Some(live),
+            // deleted by hand: the frozen epoch must not take rows again
+            None if writable => Some(Epoch::create(pdir, id, next, split.0, sizes)?),
+            None => None,
+        };
+        if let Some(live) = live {
+            live.load_words(words)?;
+            let epochs = Epochs { committing: Some(base), live: Some(live) };
+            return Ok(OpenedEpochs { epochs, missing: false, split: Some(split) });
+        }
+    }
+    Ok(OpenedEpochs { epochs: Epochs { committing: None, live: Some(base) }, ..OpenedEpochs::default() })
+}
+
 /// The state of a store, shared with its frames (which use it to refresh a read-only store).
 struct Shared {
     dir: PathBuf,
     options: StoreOptions,
     words: SharedWords,
     writable: Arc<AtomicBool>,
-    /// Serializes everything that writes: inserting rows, creating dataframes and committing. A folder has one writer at a time.
+    /// Serializes everything that changes the pending rows: inserting rows, creating dataframes, and the freeze of a
+    /// commit (DESIGN.md 14.17). A folder has one writer at a time.
     write_mutex: Arc<Mutex<()>>,
+    /// Serializes commits and the creation of dataframes (the writers of the manifest). Holds a commit that froze its
+    /// rows but failed to write them; the next commit finishes it first.
+    commit_lock: Mutex<Option<Frozen>>,
     committed: Mutex<Committed>,
     frames: RwLock<Vec<Arc<Frame>>>,
     /// The sorted word table, present once the store has been sealed.
     word_table: RwLock<Option<WordTable>>,
     /// The open segment files of all dataframes, at most [`Store::max_open_segments`] of them.
     segment_files: Arc<FilePool>,
-    /// The current epoch of the mapped pending buffer.
-    epoch: RwLock<Option<Arc<Epoch>>>,
+    /// The epochs of the mapped pending buffer.
+    epochs: RwLock<Epochs>,
     /// Serializes the reloads of a read-only store.
     reload_lock: Mutex<()>,
     recovery: RecoveryReport,
     /// A weak reference to this, for the frames a reload adds.
     me: OnceLock<Weak<Shared>>,
-    /// Held for as long as the store is open for writing.
-    _lock: Option<WriterLock>,
+    /// The writer lock of the folder: held while the store is open for writing, released by the seal.
+    lock: Mutex<Option<FileLock>>,
+    /// The locks of this store's pending files in a shared `pending_dir` (DESIGN.md 14.18).
+    pending_locks: Mutex<Vec<PendingLock>>,
+}
+
+impl Drop for Shared {
+    /// Frames can outlive their store. Their writes stop here, under the write mutex, before the writer lock is released
+    /// with the fields: another writer may open the folder right after (DESIGN.md decision 124).
+    fn drop(&mut self) {
+        let _write = self.write_mutex.lock().ignore_poison();
+        self.writable.store(false, Ordering::Release);
+    }
 }
 
 /// A folder with a shared word heap and dictionary and the dataframes that use them.
@@ -980,33 +1181,9 @@ pub struct Store {
     shared: Arc<Shared>,
 }
 
-/// The writer lock of a folder (an exclusive advisory lock on its `lock` file), released when dropped.
-struct WriterLock {
-    file: File,
-    /// The process that took the lock.
-    owner: u32,
-}
-
-impl Drop for WriterLock {
-    /// Unlocks explicitly before the file is closed. On Unix the lock belongs to the open file, which a child process
-    /// forked by another thread shares until it executes: closing only our handle would leave the lock held by the
-    /// child's copy, and an immediate reopen would fail with `Error::Locked`. An unlock through any copy releases it
-    /// for all. Only the process that took the lock unlocks: a forked child that drops an inherited store must not
-    /// release its parent's lock. On Windows the explicit unlock also makes the release immediate.
-    fn drop(&mut self) {
-        if self.owner == std::process::id() {
-            let _ = fs4::FileExt::unlock(&self.file);
-        }
-    }
-}
-
-fn acquire_writer_lock(dir: &Path) -> Result<WriterLock> {
-    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join("lock"))?;
-    match fs4::FileExt::try_lock(&file) {
-        Ok(()) => Ok(WriterLock { file, owner: std::process::id() }),
-        Err(fs4::TryLockError::WouldBlock) => Err(Error::Locked),
-        Err(fs4::TryLockError::Error(e)) => Err(e.into()),
-    }
+/// Takes the writer lock of a folder (an exclusive lock on its `lock` file, see [`crate::lock`]); released when dropped.
+fn acquire_writer_lock(dir: &Path) -> Result<FileLock> {
+    FileLock::try_lock(&dir.join("lock"))
 }
 
 fn open_segment(
@@ -1031,16 +1208,34 @@ impl Store {
     pub fn create(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
         let dir = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        if dir.join("manifest").exists() {
-            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "a store exists in this folder")));
+        let exists = || dir.join("manifest").exists();
+        let already = || Error::Io(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "a store exists in this folder"));
+        if exists() {
+            return Err(already());
         }
         let lock = acquire_writer_lock(&dir)?;
+        // again under the lock: a create that ran between the check and the lock made a store here (DESIGN.md decision 127)
+        if exists() {
+            return Err(already());
+        }
         File::create(dir.join("heap.bin"))?.write_all(HEAP_MAGIC)?;
         let store_id = new_store_id(&dir);
         let mapped = options.mapped();
         let pending_text = if mapped { options.pending_dir_text()? } else { String::new() };
-        let epoch =
-            if mapped { Some(Epoch::create(&pending_dir(&dir, &pending_text), store_id, 1, 0, options.chunk_sizes())?) } else { None };
+        let mut pending_locks = Vec::new();
+        let epoch = if mapped {
+            let pdir = pending_dir(&dir, &pending_text);
+            if !pending_text.is_empty() {
+                match claim_pending(&pdir, store_id, &dir)? {
+                    Claim::Ours(lock) => pending_locks.push(lock),
+                    // a new random id that another store has: practically impossible
+                    Claim::Copy => return Err(Error::Locked),
+                }
+            }
+            Some(Epoch::create(&pdir, store_id, 1, 0, options.chunk_sizes())?)
+        } else {
+            None
+        };
         let manifest = Manifest {
             sealed: false,
             heap_bytes: HEAP_MAGIC.len() as u64,
@@ -1060,15 +1255,17 @@ impl Store {
                 words,
                 writable: Arc::new(AtomicBool::new(true)),
                 write_mutex: Arc::new(Mutex::new(())),
+                commit_lock: Mutex::new(None),
                 committed: Mutex::new(Committed::from_manifest(&manifest, 0)),
                 frames: RwLock::new(Vec::new()),
                 word_table: RwLock::new(None),
                 segment_files: FilePool::new(DEFAULT_MAX_OPEN_SEGMENTS),
-                epoch: RwLock::new(epoch),
+                epochs: RwLock::new(Epochs { committing: None, live: epoch }),
                 reload_lock: Mutex::new(()),
                 recovery: RecoveryReport::default(),
                 me: OnceLock::new(),
-                _lock: Some(lock),
+                lock: Mutex::new(Some(lock)),
+                pending_locks: Mutex::new(pending_locks),
             }),
         }
         .with_me())
@@ -1080,10 +1277,10 @@ impl Store {
     }
 
     /// Opens an existing store for reading and writing. Fails with [`Error::Locked`] if another process has it open for
-    /// writing, and with [`Error::ReadOnly`] if it was sealed. Files left by an interrupted commit are removed. Pending
-    /// rows left by a process that ended without committing are recovered (see [`Store::recovery`]). If the options ask
-    /// for another [`PendingMode`] or `pending_dir` than the store uses, the pending rows are committed and the store
-    /// switches.
+    /// writing, and with [`Error::ReadOnly`] if it was sealed. Files left by an interrupted commit are removed, and a
+    /// commit that a crash interrupted after it took the pending rows over is finished. Pending rows left by a process
+    /// that ended without committing are recovered (see [`Store::recovery`]). If the options ask for another
+    /// [`PendingMode`] or `pending_dir` than the store uses, the pending rows are committed and the store switches.
     pub fn open(path: impl AsRef<Path>, options: StoreOptions) -> Result<Self> {
         Self::open_with(path.as_ref(), options, true)
     }
@@ -1096,8 +1293,29 @@ impl Store {
     }
 
     fn open_with(dir: &Path, options: StoreOptions, writable: bool) -> Result<Self> {
-        let lock = if writable { Some(acquire_writer_lock(dir)?) } else { None };
-        let manifest = read_manifest(dir)?;
+        let mut lock = if writable { Some(acquire_writer_lock(dir)?) } else { None };
+        // A reader may read a manifest whose pending files the writer deletes right after, because it committed again:
+        // it starts over from the new manifest (DESIGN.md decision 128). The writer lock keeps the manifest of a writer.
+        let mut tries = 0;
+        loop {
+            let manifest = read_manifest(dir)?;
+            let outdated =
+                |tries: usize| -> Result<bool> { Ok(!writable && tries < READER_RETRIES && read_manifest(dir)?.epoch != manifest.epoch) };
+            match Self::open_from(dir, &options, &mut lock, manifest.clone()) {
+                Ok(Some(store)) => return Ok(store),
+                Ok(None) if outdated(tries)? => {}
+                Ok(None) => return Err(Error::Corrupt("the pending files of the manifest keep disappearing")),
+                Err(_) if outdated(tries)? => {}
+                Err(e) => return Err(e),
+            }
+            tries += 1;
+        }
+    }
+
+    /// Opens the store as `manifest` describes it. A reader gets `None` if the pending files are gone because the
+    /// manifest is outdated.
+    fn open_from(dir: &Path, options: &StoreOptions, lock: &mut Option<FileLock>, mut manifest: Manifest) -> Result<Option<Self>> {
+        let writable = lock.is_some();
         if writable && manifest.sealed {
             return Err(Error::ReadOnly);
         }
@@ -1126,24 +1344,33 @@ impl Store {
 
         let mut recovery = RecoveryReport::default();
         let pdir = pending_dir(dir, &manifest.pending_dir);
-        let epoch = if manifest.mapped && !manifest.sealed {
-            let sizes = options.chunk_sizes();
-            match Epoch::open(&pdir, manifest.store_id, manifest.epoch, manifest.heap_words, sizes, writable)? {
-                Some(epoch) => {
-                    epoch.load_words(&mut words)?;
-                    Some(epoch)
-                }
-                None => {
-                    recovery.pending_files_missing = true;
-                    match writable {
-                        true => Some(Epoch::create(&pdir, manifest.store_id, manifest.epoch, manifest.heap_words, sizes)?),
-                        false => None,
-                    }
-                }
+        let in_use = manifest.mapped && !manifest.sealed;
+        // A copy of a store with a shared pending_dir has the same store id: the pending files are the other store's.
+        let mut pending_locks = Vec::new();
+        let mut copy = false;
+        if writable && in_use && !manifest.pending_dir.is_empty() {
+            match claim_pending(&pdir, manifest.store_id, dir)? {
+                Claim::Ours(lock) => pending_locks.push(lock),
+                Claim::Copy => copy = true,
             }
-        } else {
-            None
-        };
+        }
+        let opened = if copy { OpenedEpochs::default() } else { open_epochs(&pdir, &manifest, options, &mut words, writable)? };
+        if opened.missing && !writable {
+            // gone with a tmpfs pending_dir, or deleted by a commit that came after this manifest
+            if read_manifest(dir)?.epoch != manifest.epoch {
+                return Ok(None);
+            }
+        }
+        recovery.pending_files_missing = opened.missing || copy;
+        let mut epochs = opened.epochs;
+        if writable && in_use && !copy && epochs.live.is_none() {
+            // the files are gone: the same epoch starts again, empty
+            epochs.live = Some(Epoch::create(&pdir, manifest.store_id, manifest.epoch, manifest.heap_words, options.chunk_sizes())?);
+        }
+        if copy {
+            // the switch commit below gives this store an id of its own
+            manifest.store_id = 0;
+        }
         let words = words.into_shared();
         let flag = Arc::new(AtomicBool::new(writable));
         let write_mutex = Arc::new(Mutex::new(()));
@@ -1154,17 +1381,17 @@ impl Store {
             let mut segments = Vec::new();
             let mut start = 0;
             for segment in &meta.segments {
-                segments.push(Arc::new(open_segment(dir, segment, meta.schema.len(), start, &options, &segment_files)?));
+                segments.push(Arc::new(open_segment(dir, segment, meta.schema.len(), start, options, &segment_files)?));
                 start += segment.rows;
             }
-            let pending = Pending::open(epoch.as_ref(), id, &meta.schema, &words, &options)?;
+            let pending = Pending::open(epochs.live.as_ref(), id, &meta.schema, &words, options)?;
             recovery.pending_rows += pending.rows()?;
-            let state = FrameState {
-                segments: Arc::new(segments),
-                committed_rows: start,
-                next_segment: meta.next_segment,
-                pending: Arc::new(pending),
-            };
+            let mut state = FrameState::new(segments, start, meta.next_segment, pending);
+            if epochs.committing.is_some() {
+                let committing = Pending::open(epochs.committing.as_ref(), id, &meta.schema, &words, options)?;
+                recovery.pending_rows += committing.rows()?;
+                state.committing = Some(Arc::new(committing));
+            }
             frames.push(Arc::new(Frame {
                 id,
                 name: meta.name.clone(),
@@ -1178,40 +1405,59 @@ impl Store {
         }
         let table_path = dir.join("words.idx");
         let word_table = if manifest.sealed && table_path.exists() { Some(WordTable::open(&table_path)?) } else { None };
+        // a commit that a crash interrupted after its freeze: finished below
+        let backlog = match (writable, opened.split, &epochs.live) {
+            (true, Some((words, word_bytes)), Some(live)) => Some(Frozen {
+                words,
+                word_bytes,
+                next: live.number(),
+                store_id: manifest.store_id,
+                mapped: true,
+                pending_text: manifest.pending_dir.clone(),
+                seal: false,
+            }),
+            _ => None,
+        };
         let shared = Arc::new(Shared {
             dir: dir.to_path_buf(),
-            options,
+            options: options.clone(),
             words,
             writable: flag,
             write_mutex,
+            commit_lock: Mutex::new(None),
             committed: Mutex::new(Committed::from_manifest(&manifest, word_bytes)),
             frames: RwLock::new(frames),
             word_table: RwLock::new(word_table),
             segment_files,
-            epoch: RwLock::new(epoch.clone()),
+            epochs: RwLock::new(epochs.clone()),
             reload_lock: Mutex::new(()),
             recovery,
             me: OnceLock::new(),
-            _lock: lock,
+            lock: Mutex::new(lock.take()),
+            pending_locks: Mutex::new(pending_locks),
         });
         let _ = shared.me.set(Arc::downgrade(&shared));
-        for frame in shared.frames.read().expect("frame list lock poisoned").iter() {
+        for frame in shared.frames.read().ignore_poison().iter() {
             let _ = frame.shared.set(Arc::downgrade(&shared));
         }
         let store = Self { shared };
         if writable {
             let s = &store.shared;
-            if let Some(epoch) = &epoch {
+            if let Some(live) = &epochs.live {
                 // older epochs left by an interrupted commit (and files Windows could not delete before)
-                remove_other_epochs(epoch.dir(), manifest.store_id, Some(epoch.number()), epoch.number())?;
+                let keep: Vec<u64> = epochs.all().map(|e| e.number()).collect();
+                let base = epochs.base().map_or(live.number(), |e| e.number());
+                remove_other_epochs(live.dir(), manifest.store_id, &keep, base)?;
             }
-            let wanted_dir = if s.options.mapped() { s.options.pending_dir_text()? } else { String::new() };
-            let switch = manifest.store_id == 0 || manifest.mapped != s.options.mapped() || manifest.pending_dir != wanted_dir;
-            if switch {
-                store.commit()?;
+            let mut pending = s.commit_lock.lock().or_poisoned()?;
+            *pending = backlog;
+            // a failure leaves the commit for the next one; its rows stay readable meanwhile
+            let _ = s.flush_backlog(&mut pending);
+            if s.needs_switch()? {
+                s.commit_locked(&mut pending, false)?;
             }
         }
-        Ok(store)
+        Ok(Some(store))
     }
 
     /// The word store shared by all dataframes.
@@ -1255,22 +1501,27 @@ impl Store {
     }
 
     /// Adds a dataframe. It is recorded in the manifest at once, so read-only stores see it; its rows are pending until
-    /// the next commit.
+    /// the next commit. It waits for a commit running on another thread.
     pub fn create_frame(&self, name: &str, schema: Schema) -> Result<Arc<Frame>> {
         let s = &self.shared;
         if !self.is_writable() {
             return Err(Error::ReadOnly);
         }
-        let _write = s.write_mutex.lock().expect("write mutex poisoned");
-        let committed = s.committed.lock().expect("commit lock poisoned");
-        let mut frames = s.frames.write().expect("frame list lock poisoned");
+        let mut backlog = s.commit_lock.lock().or_poisoned()?;
+        // a new dataframe has no rows in the commit: that commit is finished first
+        s.flush_backlog(&mut backlog)?;
+        let _write = s.write_mutex.lock().or_poisoned()?;
+        if !self.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let committed = s.committed.lock().or_poisoned()?;
+        let mut frames = s.frames.write().or_poisoned()?;
         if frames.iter().any(|f| f.name == name) {
             return Err(Error::FrameExists);
         }
         let id = frames.len();
-        let epoch = s.epoch.read().expect("epoch lock poisoned").clone();
-        let pending = Pending::open(epoch.as_ref(), id, &schema, &s.words, &s.options)?;
-        let state = FrameState { segments: Arc::new(Vec::new()), committed_rows: 0, next_segment: 0, pending: Arc::new(pending) };
+        let live = s.epochs.read().or_poisoned()?.live.clone();
+        let pending = Pending::open(live.as_ref(), id, &schema, &s.words, &s.options)?;
         let frame = Arc::new(Frame {
             id,
             name: name.to_owned(),
@@ -1278,7 +1529,7 @@ impl Store {
             words: s.words.clone(),
             writable: s.writable.clone(),
             write_mutex: s.write_mutex.clone(),
-            state: RwLock::new(state),
+            state: RwLock::new(FrameState::new(Vec::new(), 0, 0, pending)),
             shared: OnceLock::new(),
         });
         let _ = frame.shared.set(Arc::downgrade(s));
@@ -1293,7 +1544,7 @@ impl Store {
     pub fn frame(&self, name: &str) -> Result<Arc<Frame>> {
         let s = &self.shared;
         s.refresh()?;
-        let find = || s.frames.read().expect("frame list lock poisoned").iter().find(|f| f.name == name).cloned();
+        let find = || s.frames.read().ignore_poison().iter().find(|f| f.name == name).cloned();
         if let Some(frame) = find() {
             return Ok(frame);
         }
@@ -1310,27 +1561,28 @@ impl Store {
         if s.follows_writer() {
             let _ = s.reload();
         }
-        s.frames.read().expect("frame list lock poisoned").iter().map(|f| f.name.clone()).collect()
+        s.frames.read().ignore_poison().iter().map(|f| f.name.clone()).collect()
     }
 
-    /// Rows pushed since the last commit, in all dataframes.
+    /// Rows not committed yet in all dataframes, including those of a commit under way.
     pub fn pending_rows(&self) -> u64 {
-        self.shared.frames.read().expect("frame list lock poisoned").iter().map(|f| f.pending_rows()).sum()
+        self.shared.frames.read().ignore_poison().iter().map(|f| f.pending_rows()).sum()
     }
 
-    /// Bytes the pending rows take: the cells and row heaps of all dataframes and the words added since the last commit.
+    /// Bytes the pending rows take: the cells and row heaps of all dataframes and the words added since the last commit
+    /// (including those of a commit under way).
     pub fn pending_bytes(&self) -> u64 {
         let s = &self.shared;
-        let frames: u64 = s.frames.read().expect("frame list lock poisoned").iter().map(|f| f.pending_bytes()).sum();
-        let word_bytes = s.committed.lock().expect("commit lock poisoned").word_bytes;
-        let words = s.words.read().expect("word store lock poisoned").heap().byte_len();
+        let frames: u64 = s.frames.read().ignore_poison().iter().map(|f| f.pending_bytes()).sum();
+        let word_bytes = s.committed.lock().ignore_poison().word_bytes;
+        let words = s.words.read().ignore_poison().heap().byte_len();
         frames + words.saturating_sub(word_bytes)
     }
 
     /// Commits if any dataframe has at least `segment_rows` pending rows. Returns whether it committed.
     pub fn commit_if_full(&self) -> Result<bool> {
         let rows = self.shared.options.segment_rows as u64;
-        let full = self.shared.frames.read().expect("frame list lock poisoned").iter().any(|f| f.pending_rows() >= rows);
+        let full = self.shared.frames.read().or_poisoned()?.iter().any(|f| f.pending_rows() >= rows);
         if full {
             self.commit()?;
         }
@@ -1339,15 +1591,22 @@ impl Store {
 
     /// Commits when it is due (DESIGN.md 14.9): a dataframe has `segment_rows` pending rows, the pending rows take
     /// `commit_policy.max_bytes`, or the oldest pending row is `commit_policy.max_age` old. Returns what triggered the
-    /// commit, or `None`. Call it regularly while writing (for example every 1,000 rows, and from a timer when an age
-    /// limit is set).
+    /// commit, or `None`; also `None` while a commit runs on another thread (its rows are being committed). Call it
+    /// regularly while writing (for example every 1,000 rows, and from a timer when an age limit is set). Called from a
+    /// thread of its own, the commit does not hold up `push_row` (DESIGN.md 14.17).
     pub fn commit_if_due(&self) -> Result<Option<CommitTrigger>> {
+        let s = &self.shared;
         if !self.is_writable() {
             return Err(Error::ReadOnly);
         }
+        let mut backlog = match s.commit_lock.try_lock() {
+            Ok(backlog) => backlog,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => return Err(Error::Corrupt(crate::sync::POISONED)),
+        };
         let trigger = self.due();
         if trigger.is_some() {
-            self.commit()?;
+            s.commit_locked(&mut backlog, false)?;
         }
         Ok(trigger)
     }
@@ -1355,7 +1614,7 @@ impl Store {
     fn due(&self) -> Option<CommitTrigger> {
         let s = &self.shared;
         let policy = &s.options.commit_policy;
-        let frames = s.frames.read().expect("frame list lock poisoned").clone();
+        let frames = s.frames.read().ignore_poison().clone();
         if frames.iter().any(|f| f.pending_rows() >= s.options.segment_rows as u64) {
             return Some(CommitTrigger::Rows);
         }
@@ -1363,17 +1622,19 @@ impl Store {
             return Some(CommitTrigger::Bytes);
         }
         let max_age = policy.max_age?;
-        let pending = |f: &Arc<Frame>| f.state.read().expect("frame lock poisoned").pending.clone();
-        let oldest = frames.iter().map(pending).map(|p| p.first_push_ms()).filter(|&ms| ms > 0).min()?;
+        let oldest = frames.iter().map(|f| f.first_push_ms()).filter(|&ms| ms > 0).min()?;
         (now_unix_ms().saturating_sub(oldest) >= max_age.as_millis() as u64).then_some(CommitTrigger::Age)
     }
 
-    /// Writes everything pending to disk: new words, one segment per dataframe with new rows, then the manifest.
+    /// Writes everything pending to disk: new words, one segment per dataframe with new rows, then the manifest. Rows
+    /// pushed from other threads meanwhile go to the next commit; `push_row` waits only while the pending rows are taken
+    /// over, not while they are compressed and written (DESIGN.md 14.17).
     pub fn commit(&self) -> Result<()> {
         self.shared.commit(false)
     }
 
-    /// Commits and closes the store for writing; it can only be opened read-only afterwards (log rotation).
+    /// Commits and closes the store for writing; it can only be opened read-only afterwards (log rotation). `push_row`
+    /// waits for it. The writer lock is released at once, so [`Store::build_indexes`] can run on the folder.
     pub fn seal(&self) -> Result<()> {
         self.shared.commit(true)
     }
@@ -1423,8 +1684,8 @@ impl Store {
         if s.refresh().and_then(|()| s.load_pending_words()).is_err() {
             return None;
         }
-        let words = s.words.read().expect("word store lock poisoned");
-        match &*s.word_table.read().expect("word table lock poisoned") {
+        let words = s.words.read().ignore_poison();
+        match &*s.word_table.read().ignore_poison() {
             Some(table) => table.lookup(&words, word),
             None => words.lookup(word),
         }
@@ -1435,8 +1696,8 @@ impl Store {
     pub fn words_with_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
         let s = &self.shared;
         let _ = s.refresh().and_then(|()| s.load_pending_words());
-        let words = s.words.read().expect("word store lock poisoned");
-        if let Some(table) = &*s.word_table.read().expect("word table lock poisoned") {
+        let words = s.words.read().ignore_poison();
+        if let Some(table) = &*s.word_table.read().ignore_poison() {
             return table.prefix(&words, prefix, limit);
         }
         let mut found: Vec<String> =
@@ -1451,8 +1712,8 @@ impl Store {
         let s = &self.shared;
         let manifest = read_manifest(&s.dir)?;
         read_heap(&s.dir.join("heap.bin"), manifest.heap_bytes, manifest.heap_words)?;
-        for frame in s.frames.read().expect("frame list lock poisoned").iter() {
-            let segments = frame.state.read().expect("frame lock poisoned").segments.clone();
+        for frame in s.frames.read().or_poisoned()?.iter() {
+            let segments = frame.state.read().or_poisoned()?.segments.clone();
             for segment in segments.iter() {
                 segment.reader.verify()?;
                 if let Some(index) = &segment.index {
@@ -1460,7 +1721,7 @@ impl Store {
                 }
             }
         }
-        if let Some(table) = &*s.word_table.read().expect("word table lock poisoned") {
+        if let Some(table) = &*s.word_table.read().or_poisoned()? {
             table.verify()?;
         }
         Ok(())
@@ -1494,7 +1755,7 @@ impl Shared {
             frames: frames
                 .iter()
                 .map(|frame| {
-                    let state = frame.state.read().expect("frame lock poisoned");
+                    let state = frame.state.read().ignore_poison();
                     FrameMeta {
                         name: frame.name.clone(),
                         schema: frame.schema.clone(),
@@ -1510,159 +1771,317 @@ impl Shared {
         }
     }
 
-    /// Commits (DESIGN.md 7 and 14.6): new words, one segment per dataframe with pending rows, the empty pending buffers of
-    /// the next epoch, then the manifest; then the old epoch is marked as superseded and its files are deleted.
     fn commit(&self, seal: bool) -> Result<()> {
         if !self.is_writable() {
             return Err(Error::ReadOnly);
         }
-        let _write = self.write_mutex.lock().expect("write mutex poisoned");
-        let mut committed = self.committed.lock().expect("commit lock poisoned");
-        let frames = self.frames.read().expect("frame list lock poisoned");
-        let mut guards: Vec<_> = frames.iter().map(|f| f.state.write().expect("frame lock poisoned")).collect();
+        let mut backlog = self.commit_lock.lock().or_poisoned()?;
+        self.commit_locked(&mut backlog, seal)
+    }
 
-        let (heap_bytes, heap_words, word_bytes) = {
-            let words = self.words.read().expect("word store lock poisoned");
-            let count = words.word_count();
-            let o = &self.options;
-            let path = self.dir.join("heap.bin");
-            let bytes = append_heap(&path, committed.heap_bytes, &words, committed.heap_words, count, o.heap_block_bytes, o.zstd_level)?;
-            (bytes, count, words.heap().byte_len())
-        };
-
-        let mut written: Vec<(usize, String, u64)> = Vec::new();
-        let mut failure = None;
-        for (i, (frame, guard)) in frames.iter().zip(&guards).enumerate() {
-            let rows = match guard.pending.rows() {
-                Ok(rows) => rows,
-                Err(e) => {
-                    failure = Some(e);
-                    break;
-                }
-            };
-            if rows == 0 {
-                continue;
+    /// Commits (DESIGN.md 7 and 14.17), with the commit lock held: finishes an earlier commit that failed, freezes the
+    /// pending rows under the write mutex (short), then writes them without it. A seal, and a commit that changes the
+    /// pending mode, directory or store id, run whole under the write mutex and are undone if they fail.
+    fn commit_locked(&self, backlog: &mut Option<Frozen>, seal: bool) -> Result<()> {
+        if !self.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        self.flush_backlog(backlog)?;
+        if seal || self.needs_switch()? {
+            let _write = self.write_mutex.lock().or_poisoned()?;
+            let frozen = self.freeze(seal, false)?;
+            if let Err(e) = self.finish(&frozen) {
+                self.unfreeze(&frozen);
+                return Err(e);
             }
-            let file = format!("f{}-{:06}.seg", frame.id, guard.next_segment);
-            match guard.pending.write_segment(&self.dir, &file, &frame.schema, &self.words, &self.options) {
-                Ok(()) => written.push((i, file, rows)),
+            return Ok(());
+        }
+        let frozen = {
+            let _write = self.write_mutex.lock().or_poisoned()?;
+            self.freeze(false, true)?
+        };
+        if let Err(e) = self.finish(&frozen) {
+            // the frozen rows stay readable; the next commit finishes this one first
+            *backlog = Some(frozen);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Finishes a commit whose rows were frozen before (one that failed, or that a crash interrupted).
+    fn flush_backlog(&self, backlog: &mut Option<Frozen>) -> Result<()> {
+        if let Some(frozen) = backlog.as_ref() {
+            self.finish(frozen)?;
+            *backlog = None;
+        }
+        Ok(())
+    }
+
+    /// Whether the next commit changes the pending mode, directory or store id (not followed by readers mid-commit).
+    fn needs_switch(&self) -> Result<bool> {
+        let wanted = if self.options.mapped() { self.options.pending_dir_text()? } else { String::new() };
+        let committed = self.committed.lock().or_poisoned()?;
+        Ok(committed.store_id == 0 || committed.mapped != self.options.mapped() || committed.pending_dir != wanted)
+    }
+
+    /// Takes the lock of the pending files of `store_id` in the shared directory `dir` (DESIGN.md 14.18). Returns the id
+    /// to use: a new one if another store holds `store_id` there.
+    fn hold_pending_lock(&self, dir: &Path, store_id: u128) -> Result<u128> {
+        let mut locks = self.pending_locks.lock().or_poisoned()?;
+        if locks.iter().any(|l| l.dir == dir && l.store_id == store_id) {
+            return Ok(store_id);
+        }
+        let mut id = store_id;
+        for _ in 0..3 {
+            match claim_pending(dir, id, &self.dir)? {
+                Claim::Ours(lock) => {
+                    locks.push(lock);
+                    return Ok(id);
+                }
+                Claim::Copy => id = new_store_id(&self.dir),
+            }
+        }
+        Err(Error::Locked)
+    }
+
+    /// Releases (and deletes) the pending locks other than the one of the files in use.
+    fn keep_pending_lock(&self, mapped: bool, pending_text: &str, store_id: u128) {
+        let keep = (mapped && !pending_text.is_empty()).then(|| PathBuf::from(pending_text));
+        let mut locks = self.pending_locks.lock().ignore_poison();
+        let (kept, released): (Vec<_>, Vec<_>) =
+            locks.drain(..).partition(|l| keep.as_ref().is_some_and(|dir| *dir == l.dir) && l.store_id == store_id);
+        *locks = kept;
+        for lock in released {
+            lock.lock.remove();
+        }
+    }
+
+    /// Step 1 of a commit, under the write mutex (DESIGN.md 14.17): the pending buffers become the committing ones and
+    /// new, empty buffers in the next epoch take the next rows. With `link`, readers in other processes follow into the
+    /// next epoch at once; the files of that epoch must then have the same directory and store id.
+    fn freeze(&self, seal: bool, link: bool) -> Result<Frozen> {
+        let (number, old_id) = {
+            let committed = self.committed.lock().or_poisoned()?;
+            (committed.epoch, committed.store_id)
+        };
+        let mut store_id = if old_id == 0 { new_store_id(&self.dir) } else { old_id };
+        let (words, word_bytes) = {
+            let words = self.words.read().or_poisoned()?;
+            (words.word_count(), words.heap().byte_len())
+        };
+        let next = number + 1;
+        let mapped = !seal && self.options.mapped();
+        let pending_text = if mapped { self.options.pending_dir_text()? } else { String::new() };
+        let frames = self.frames.read().or_poisoned()?.clone();
+        let live = if mapped {
+            let dir = pending_dir(&self.dir, &pending_text);
+            if !pending_text.is_empty() {
+                store_id = self.hold_pending_lock(&dir, store_id)?;
+            }
+            Some(Epoch::create(&dir, store_id, next, words, self.options.chunk_sizes())?)
+        } else {
+            None
+        };
+        let opened: Result<Vec<Arc<Pending>>> =
+            frames.iter().map(|f| Pending::open(live.as_ref(), f.id, &f.schema, &self.words, &self.options).map(Arc::new)).collect();
+        let pending = match opened {
+            Ok(pending) => pending,
+            Err(e) => {
+                if let Some(live) = live {
+                    let dir = live.dir().to_path_buf();
+                    drop(live);
+                    remove_epoch(&dir, store_id, next);
+                }
+                return Err(e);
+            }
+        };
+        // From here on nothing fails.
+        let old = self.epochs.read().ignore_poison().live.clone();
+        if link {
+            let same_files = |o: &Arc<Epoch>| live.as_ref().is_some_and(|l| l.dir() == o.dir()) && store_id == old_id;
+            if let Some(old) = old.as_ref().filter(|o| same_files(o)) {
+                // after the last row of the old epoch (the write mutex is held), before the next one gets rows
+                old.set_next(next);
+            }
+        }
+        for (frame, pending) in frames.iter().zip(pending) {
+            let mut state = frame.state.write().ignore_poison();
+            let frozen = std::mem::replace(&mut state.pending, pending);
+            state.committing = Some(frozen);
+        }
+        *self.epochs.write().ignore_poison() = Epochs { committing: old, live };
+        Ok(Frozen { words, word_bytes, next, store_id, mapped, pending_text, seal })
+    }
+
+    /// Undoes a freeze whose commit failed, under the write mutex it was made under (no row was pushed since).
+    fn unfreeze(&self, frozen: &Frozen) {
+        let frames = self.frames.read().ignore_poison().clone();
+        for frame in &frames {
+            let mut state = frame.state.write().ignore_poison();
+            if let Some(committing) = state.committing.take() {
+                state.pending = committing;
+            }
+        }
+        let new = {
+            let mut epochs = self.epochs.write().ignore_poison();
+            let new = epochs.live.take();
+            epochs.live = epochs.committing.take();
+            new
+        };
+        if let Some(new) = new {
+            let dir = new.dir().to_path_buf();
+            drop(new);
+            remove_epoch(&dir, frozen.store_id, frozen.next);
+        }
+        let committed = self.committed.lock().ignore_poison();
+        let (mapped, text, id) = (committed.mapped, committed.pending_dir.clone(), committed.store_id);
+        drop(committed);
+        self.keep_pending_lock(mapped, &text, id);
+    }
+
+    /// Step 2 of a commit, without the write mutex: the new words and one segment per dataframe from the committing
+    /// buffers, then the manifest, then the switch-over. Everything that can fail comes before the manifest, so a
+    /// failure changes nothing in memory and the commit can be finished later (DESIGN.md decision 126).
+    fn finish(&self, frozen: &Frozen) -> Result<()> {
+        let (heap_bytes, heap_words, old_id, sealed) = {
+            let committed = self.committed.lock().or_poisoned()?;
+            (committed.heap_bytes, committed.heap_words, committed.store_id, committed.sealed)
+        };
+        let o = &self.options;
+        let new_words: Vec<String> = {
+            let words = self.words.read().or_poisoned()?;
+            (heap_words..frozen.words)
+                .map(|i| words.get(i).map(str::to_owned).ok_or(Error::Corrupt("missing word")))
+                .collect::<Result<_>>()?
+        };
+        let heap_len = append_heap(&self.dir.join("heap.bin"), heap_bytes, &new_words, o.heap_block_bytes, o.zstd_level)?;
+        drop(new_words);
+
+        let frames = self.frames.read().or_poisoned()?.clone();
+        let mut new_segments: Vec<Option<Segment>> = frames.iter().map(|_| None).collect();
+        let discard = |new_segments: &mut Vec<Option<Segment>>| {
+            for segment in new_segments.iter_mut().filter_map(Option::take) {
+                let file = segment.file.clone();
+                drop(segment);
+                let _ = std::fs::remove_file(self.dir.join(&file));
+                let _ = std::fs::remove_file(self.dir.join(file.replace(".seg", ".idx")));
+            }
+        };
+        for (i, frame) in frames.iter().enumerate() {
+            let (committing, next_segment, start) = {
+                let state = frame.state.read().or_poisoned()?;
+                (state.committing.clone(), state.next_segment, state.committed_rows)
+            };
+            let Some(committing) = committing else { continue };
+            let written = committing.rows().and_then(|rows| {
+                if rows == 0 {
+                    return Ok(None);
+                }
+                let meta = SegmentMeta { file: format!("f{}-{:06}.seg", frame.id, next_segment), rows };
+                let made = committing
+                    .write_segment(&self.dir, &meta.file, &frame.schema, &self.words, o)
+                    .and_then(|()| open_segment(&self.dir, &meta, frame.schema.len(), start, o, &self.segment_files));
+                if made.is_err() {
+                    let _ = std::fs::remove_file(self.dir.join(&meta.file));
+                    let _ = std::fs::remove_file(self.dir.join(meta.file.replace(".seg", ".idx")));
+                }
+                made.map(Some)
+            });
+            match written {
+                Ok(segment) => new_segments[i] = segment,
                 Err(e) => {
-                    let _ = std::fs::remove_file(self.dir.join(&file));
-                    let _ = std::fs::remove_file(self.dir.join(file.replace(".seg", ".idx")));
-                    failure = Some(e);
-                    break;
+                    discard(&mut new_segments);
+                    return Err(e);
                 }
             }
         }
-
-        // the pending buffers of the next epoch
-        let store_id = if committed.store_id == 0 { new_store_id(&self.dir) } else { committed.store_id };
-        let next = committed.epoch + 1;
-        let mapped = !seal && self.options.mapped();
-        let mut pending_text = String::new();
-        let mut next_epoch = None;
-        let mut next_pending = Vec::new();
-        if failure.is_none() {
-            let made = (|| -> Result<_> {
-                pending_text = if mapped { self.options.pending_dir_text()? } else { String::new() };
-                let dir = pending_dir(&self.dir, &pending_text);
-                let epoch = if mapped { Some(Epoch::create(&dir, store_id, next, heap_words, self.options.chunk_sizes())?) } else { None };
-                let pending = frames
-                    .iter()
-                    .map(|f| Pending::open(epoch.as_ref(), f.id, &f.schema, &self.words, &self.options).map(Arc::new))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok((epoch, pending))
+        let table = if frozen.seal {
+            let made = (|| {
+                let (path, tmp) = (self.dir.join("words.idx"), self.dir.join("words.idx.tmp"));
+                let _ = std::fs::remove_file(&tmp);
+                WordTable::write(&tmp, &*self.words.read().or_poisoned()?)?;
+                std::fs::rename(&tmp, &path)?;
+                WordTable::open(&path)
             })();
             match made {
-                Ok((epoch, pending)) => (next_epoch, next_pending) = (epoch, pending),
-                Err(e) => failure = Some(e),
+                Ok(table) => Some(table),
+                Err(e) => {
+                    discard(&mut new_segments);
+                    return Err(e);
+                }
             }
-        }
+        } else {
+            None
+        };
 
         let manifest = Manifest {
-            sealed: seal || committed.sealed,
-            heap_bytes,
-            heap_words,
+            sealed: frozen.seal || sealed,
+            heap_bytes: heap_len,
+            heap_words: frozen.words,
             frames: frames
                 .iter()
-                .zip(&guards)
-                .enumerate()
-                .map(|(i, (frame, guard))| {
+                .zip(&new_segments)
+                .map(|(frame, new)| {
+                    let state = frame.state.read().ignore_poison();
                     let mut segments: Vec<SegmentMeta> =
-                        guard.segments.iter().map(|s| SegmentMeta { file: s.file.clone(), rows: s.rows }).collect();
-                    let new = written.iter().find(|(index, _, _)| *index == i);
-                    segments.extend(new.map(|(_, file, rows)| SegmentMeta { file: file.clone(), rows: *rows }));
+                        state.segments.iter().map(|s| SegmentMeta { file: s.file.clone(), rows: s.rows }).collect();
+                    segments.extend(new.as_ref().map(|s| SegmentMeta { file: s.file.clone(), rows: s.rows }));
                     FrameMeta {
                         name: frame.name.clone(),
                         schema: frame.schema.clone(),
                         segments,
-                        next_segment: guard.next_segment + u32::from(new.is_some()),
+                        next_segment: state.next_segment + u32::from(new.is_some()),
                     }
                 })
                 .collect(),
-            epoch: next,
-            store_id,
-            mapped,
-            pending_dir: pending_text.clone(),
+            epoch: frozen.next,
+            store_id: frozen.store_id,
+            mapped: frozen.mapped,
+            pending_dir: frozen.pending_text.clone(),
         };
-        let outcome = match failure {
-            Some(e) => Err(e),
-            None => write_manifest(&self.dir, &manifest),
-        };
-        if let Err(e) = outcome {
-            for (_, file, _) in &written {
-                let _ = std::fs::remove_file(self.dir.join(file));
-                let _ = std::fs::remove_file(self.dir.join(file.replace(".seg", ".idx")));
-            }
-            drop(next_pending);
-            if let Some(epoch) = next_epoch {
-                let dir = epoch.dir().to_path_buf();
-                drop(epoch);
-                remove_epoch(&dir, store_id, next);
-            }
+        if let Err(e) = write_manifest(&self.dir, &manifest) {
+            discard(&mut new_segments);
             return Err(e);
         }
 
-        // The manifest is replaced: the commit happened. Now switch the in-memory state over.
-        for (i, file, rows) in written {
-            let guard = &mut guards[i];
-            let meta = SegmentMeta { file, rows };
-            let segment = open_segment(&self.dir, &meta, frames[i].schema.len(), guard.committed_rows, &self.options, &self.segment_files)?;
-            let mut segments: Vec<Arc<Segment>> = guard.segments.iter().cloned().collect();
-            segments.push(Arc::new(segment));
-            guard.segments = Arc::new(segments);
-            guard.committed_rows += rows;
-            guard.next_segment += 1;
+        // The manifest is replaced: the commit happened. Now switch the in-memory state over (nothing fails here).
+        for (frame, new) in frames.iter().zip(new_segments) {
+            let mut state = frame.state.write().ignore_poison();
+            if let Some(segment) = new {
+                let mut segments: Vec<Arc<Segment>> = state.segments.iter().cloned().collect();
+                state.committed_rows += segment.rows;
+                segments.push(Arc::new(segment));
+                state.segments = Arc::new(segments);
+                state.next_segment += 1;
+            }
+            state.committing = None;
         }
-        for (i, guard) in guards.iter_mut().enumerate() {
-            // a sealed store gets empty memory buffers: no more rows come
-            guard.pending = match next_pending.get(i) {
-                Some(pending) => pending.clone(),
-                None => Arc::new(Pending::memory(&frames[i].schema, &self.words, &self.options)),
-            };
+        *self.committed.lock().ignore_poison() = Committed::from_manifest(&manifest, frozen.word_bytes);
+        let (old, live) = {
+            let mut epochs = self.epochs.write().ignore_poison();
+            (epochs.committing.take(), epochs.live.clone())
+        };
+        if let Some(table) = table {
+            *self.word_table.write().ignore_poison() = Some(table);
         }
-        drop(guards);
-        let old_epoch = std::mem::replace(&mut *self.epoch.write().expect("epoch lock poisoned"), next_epoch.clone());
-        *committed = Committed::from_manifest(&manifest, word_bytes);
-        if seal {
-            let path = self.dir.join("words.idx");
-            let _ = std::fs::remove_file(&path);
-            WordTable::write(&path, &self.words.read().expect("word store lock poisoned"))?;
-            *self.word_table.write().expect("word table lock poisoned") = Some(WordTable::open(&path)?);
+        if frozen.seal {
             self.writable.store(false, Ordering::Release);
+            // nothing is written any more: free the folder (for build_indexes) without waiting for the drop
+            self.lock.lock().ignore_poison().take();
         }
         // Readers still on the old epoch move on at their next query; then its files go (later on Windows if a reader
         // still maps them: retried at the next commit and open).
-        if let Some(old) = old_epoch {
-            old.set_superseded_by(if seal { SEALED } else { next });
+        if let Some(old) = old {
+            old.set_superseded_by(if frozen.seal { SEALED } else { frozen.next });
             let dir = old.dir().to_path_buf();
             drop(old);
-            let keep = next_epoch.as_ref().filter(|e| e.dir() == dir).map(|e| e.number());
-            let _ = remove_other_epochs(&dir, store_id, keep, next);
+            let keep: Vec<u64> = live.iter().filter(|e| e.dir() == dir && frozen.store_id == old_id).map(|e| e.number()).collect();
+            let _ = remove_other_epochs(&dir, old_id, &keep, frozen.next);
         }
-        if let Some(epoch) = &next_epoch {
-            let _ = remove_other_epochs(epoch.dir(), store_id, Some(next), next);
+        if let Some(live) = &live {
+            let _ = remove_other_epochs(live.dir(), frozen.store_id, &[frozen.next], frozen.next);
         }
+        self.keep_pending_lock(frozen.mapped, &frozen.pending_text, frozen.store_id);
         Ok(())
     }
 
@@ -1671,26 +2090,80 @@ impl Shared {
         if self.is_writable() {
             return false;
         }
-        let committed = self.committed.lock().expect("commit lock poisoned");
+        let committed = self.committed.lock().ignore_poison();
         committed.mapped && !committed.sealed
     }
 
-    /// Read-only stores: picks up a commit of the writer (DESIGN.md 14.7). Costs a few atomic loads when nothing changed.
+    /// Read-only stores: picks up a commit of the writer, and follows it into the next epoch when it starts one
+    /// (DESIGN.md 14.7 and 14.17). Costs a few atomic loads when nothing changed.
     fn refresh(&self) -> Result<()> {
         if !self.follows_writer() {
             return Ok(());
         }
-        let epoch = self.epoch.read().expect("epoch lock poisoned").clone();
-        let changed = match &epoch {
-            Some(epoch) => epoch.superseded_by() != 0,
-            // the pending files were missing: a writer that reopens the store creates them again
+        let epochs = self.epochs.read().or_poisoned()?.clone();
+        let reload = match epochs.base() {
+            Some(base) => base.superseded_by() != 0,
             None => {
-                let committed = self.committed.lock().expect("commit lock poisoned");
-                let dir = pending_dir(&self.dir, &committed.pending_dir);
-                crate::pending::epoch_exists(&dir, committed.store_id, committed.epoch)
+                // The pending files were missing: a writer that reopens the store creates them again, and a commit names
+                // new ones (the manifest is read only in this state).
+                let (dir, id, number) = {
+                    let committed = self.committed.lock().or_poisoned()?;
+                    (pending_dir(&self.dir, &committed.pending_dir), committed.store_id, committed.epoch)
+                };
+                crate::pending::epoch_exists(&dir, id, number) || read_manifest(&self.dir)?.epoch != number
             }
         };
-        if changed { self.reload() } else { Ok(()) }
+        if reload {
+            self.reload()?;
+        }
+        let epochs = self.epochs.read().or_poisoned()?.clone();
+        let starts_next = epochs.committing.is_none() && epochs.live.as_ref().is_some_and(|e| e.next() != 0 && e.superseded_by() == 0);
+        if starts_next {
+            self.advance()?;
+        }
+        Ok(())
+    }
+
+    /// Read-only stores: the writer froze the current epoch for a commit; its buffers become the committing ones and the
+    /// next epoch's take the new rows.
+    fn advance(&self) -> Result<()> {
+        let _reload = self.reload_lock.lock().or_poisoned()?;
+        let epochs = self.epochs.read().or_poisoned()?.clone();
+        let Some(current) = epochs.live.clone() else { return Ok(()) };
+        let number = current.next();
+        if epochs.committing.is_some() || number == 0 {
+            return Ok(()); // another thread did it
+        }
+        if current.superseded_by() != 0 {
+            return self.reload_locked();
+        }
+        let store_id = self.committed.lock().or_poisoned()?.store_id;
+        // The frozen epoch gets no more words: all of them, then the next epoch's words come after them.
+        let base_words = {
+            let mut words = self.words.write().or_poisoned()?;
+            current.load_words(&mut words)?;
+            words.word_count()
+        };
+        let Some(next) = Epoch::open(current.dir(), store_id, number, base_words, self.options.chunk_sizes(), false)? else {
+            // the commit is over and the writer deleted it already
+            return self.reload_locked();
+        };
+        let frames = self.frames.read().or_poisoned()?.clone();
+        let pending: Vec<Arc<Pending>> = frames
+            .iter()
+            .map(|f| Pending::open(Some(&next), f.id, &f.schema, &self.words, &self.options).map(Arc::new))
+            .collect::<Result<_>>()?;
+        {
+            // the epochs before the buffers, under the word store: their words load before any of their rows show
+            let _words = self.words.write().or_poisoned()?;
+            *self.epochs.write().or_poisoned()? = Epochs { committing: Some(current), live: Some(next) };
+        }
+        for (frame, pending) in frames.iter().zip(pending) {
+            let mut state = frame.state.write().ignore_poison();
+            let frozen = std::mem::replace(&mut state.pending, pending);
+            state.committing = Some(frozen);
+        }
+        Ok(())
     }
 
     /// Read-only stores: loads the words of pending rows published since the last call (cheap when there are none).
@@ -1698,11 +2171,12 @@ impl Shared {
         if self.is_writable() {
             return Ok(());
         }
-        let has_new = self.epoch.read().expect("epoch lock poisoned").as_ref().is_some_and(|e| e.has_new_words());
+        let has_new = self.epochs.read().or_poisoned()?.all().any(|e| e.has_new_words());
         if has_new {
-            // the word store first, then the epoch: a reload swaps the epoch while it holds the word store
-            let mut words = self.words.write().expect("word store lock poisoned");
-            if let Some(epoch) = self.epoch.read().expect("epoch lock poisoned").clone() {
+            // the word store first, then the epochs: advance and reload switch them while they hold the word store
+            let mut words = self.words.write().or_poisoned()?;
+            let epochs = self.epochs.read().or_poisoned()?.clone();
+            for epoch in epochs.all() {
                 epoch.load_words(&mut words)?;
             }
         }
@@ -1710,32 +2184,144 @@ impl Shared {
     }
 
     /// Read-only stores: re-reads the manifest and takes over what changed: new words, new segments, new dataframes and
-    /// the pending buffer of a new epoch.
+    /// the pending buffers of a new epoch.
     fn reload(&self) -> Result<()> {
-        let _reload = self.reload_lock.lock().expect("reload lock poisoned");
-        let manifest = read_manifest(&self.dir)?;
-        let current = self.epoch.read().expect("epoch lock poisoned").clone();
-        let same_epoch = current.as_ref().is_some_and(|e| e.number() == manifest.epoch && e.superseded_by() == 0);
-        let epoch = if same_epoch {
-            current
+        let _reload = self.reload_lock.lock().or_poisoned()?;
+        self.reload_locked()
+    }
+
+    fn reload_locked(&self) -> Result<()> {
+        let mut tries = 0;
+        loop {
+            let manifest = read_manifest(&self.dir)?;
+            let outdated =
+                |tries: usize| -> Result<bool> { Ok(tries < READER_RETRIES && read_manifest(&self.dir)?.epoch != manifest.epoch) };
+            match self.reload_from(&manifest) {
+                Ok(true) => return Ok(()),
+                Ok(false) if outdated(tries)? => {}
+                Ok(false) => return Err(Error::Corrupt("the pending files of the manifest keep disappearing")),
+                // the writer committed again and deleted what this manifest names: start over (DESIGN.md decision 128)
+                Err(_) if outdated(tries)? => {}
+                Err(e) => return Err(e),
+            }
+            tries += 1;
+        }
+    }
+
+    /// Takes over `manifest`. Everything that can fail happens before anything changes; `Ok(false)` if the pending
+    /// files it names are gone and it is outdated.
+    fn reload_from(&self, manifest: &Manifest) -> Result<bool> {
+        enum Plan {
+            /// The manifest names the epoch this store is on.
+            Same,
+            /// The commit this store followed is over: the epoch it followed into is the manifest's.
+            Reuse,
+            /// Another epoch (or none).
+            Fresh(Option<Arc<Epoch>>),
+        }
+        let epochs = self.epochs.read().or_poisoned()?.clone();
+        let named = |e: &Arc<Epoch>| e.number() == manifest.epoch && e.superseded_by() == 0;
+        let plan = if epochs.base().is_some_and(named) {
+            Plan::Same
+        } else if epochs.committing.is_some() && epochs.live.as_ref().is_some_and(named) {
+            Plan::Reuse
         } else if manifest.mapped && !manifest.sealed {
-            let dir = pending_dir(&self.dir, &manifest.pending_dir);
-            Epoch::open(&dir, manifest.store_id, manifest.epoch, manifest.heap_words, self.options.chunk_sizes(), false)?
+            let pdir = pending_dir(&self.dir, &manifest.pending_dir);
+            let sizes = self.options.chunk_sizes();
+            match Epoch::open(&pdir, manifest.store_id, manifest.epoch, manifest.heap_words, sizes, false)? {
+                Some(epoch) => Plan::Fresh(Some(epoch)),
+                None if read_manifest(&self.dir)?.epoch != manifest.epoch => return Ok(false),
+                None => Plan::Fresh(None),
+            }
         } else {
-            None
+            Plan::Fresh(None)
         };
-        let mut frames = self.frames.write().expect("frame list lock poisoned");
+        let (committing_epoch, live_epoch) = match &plan {
+            Plan::Same => (epochs.committing.clone(), epochs.live.clone()),
+            Plan::Reuse => (None, epochs.live.clone()),
+            Plan::Fresh(epoch) => (None, epoch.clone()),
+        };
+
+        // What changes per dataframe: new segments; the committing buffer (outer None: unchanged); the pending buffer.
+        type Update = (Option<(Arc<Vec<Arc<Segment>>>, u64)>, Option<Option<Arc<Pending>>>, Option<Arc<Pending>>);
+        let known = self.frames.read().or_poisoned()?.clone();
+        let mut updates: Vec<Update> = Vec::new();
         for (id, meta) in manifest.frames.iter().enumerate() {
-            let is_new = id >= frames.len();
+            let (segments, committed_rows, memory) = match known.get(id) {
+                Some(frame) => {
+                    let state = frame.state.read().or_poisoned()?;
+                    (state.segments.clone(), state.committed_rows, matches!(state.pending.buffer, Buffer::Memory(_)))
+                }
+                None => (Arc::new(Vec::new()), 0, true),
+            };
+            if meta.segments.len() < segments.len() {
+                return Err(Error::Corrupt("the manifest lost segments"));
+            }
+            let new_segments = if meta.segments.len() > segments.len() {
+                let mut all: Vec<Arc<Segment>> = segments.iter().cloned().collect();
+                let mut start = committed_rows;
+                for segment in &meta.segments[segments.len()..] {
+                    all.push(Arc::new(open_segment(&self.dir, segment, meta.schema.len(), start, &self.options, &self.segment_files)?));
+                    start += segment.rows;
+                }
+                Some((Arc::new(all), start))
+            } else {
+                None
+            };
+            let is_new = id >= known.len();
+            // a new epoch, a new dataframe, or one whose pending files did not exist yet when it was opened
+            let reopen = matches!(plan, Plan::Fresh(_)) || is_new || (live_epoch.is_some() && memory);
+            let open = |epoch: Option<&Arc<Epoch>>| Pending::open(epoch, id, &meta.schema, &self.words, &self.options).map(Arc::new);
+            let pending = if reopen { Some(open(live_epoch.as_ref())?) } else { None };
+            let committing = match &plan {
+                Plan::Same if reopen => Some(committing_epoch.as_ref().map(|e| open(Some(e))).transpose()?),
+                Plan::Same => None,
+                Plan::Reuse | Plan::Fresh(_) => Some(None),
+            };
+            updates.push((new_segments, committing, pending));
+        }
+        let heap = match &plan {
+            Plan::Fresh(_) if self.words.read().or_poisoned()?.word_count() < manifest.heap_words => {
+                Some(read_heap(&self.dir.join("heap.bin"), manifest.heap_bytes, manifest.heap_words)?)
+            }
+            _ => None,
+        };
+        let table_path = self.dir.join("words.idx");
+        let table = match manifest.sealed && self.word_table.read().or_poisoned()?.is_none() && table_path.exists() {
+            true => Some(WordTable::open(&table_path)?),
+            false => None,
+        };
+
+        // The words committed since they were loaded, and the switch of the epochs, under the word store lock (see
+        // load_pending_words), before the dataframes show rows of the new epochs.
+        let word_bytes = {
+            let mut words = self.words.write().or_poisoned()?;
+            let mut word_bytes = self.committed.lock().or_poisoned()?.word_bytes;
+            if let Plan::Fresh(_) = plan {
+                if let Some(heap) = &heap {
+                    for ordinal in words.word_count()..manifest.heap_words {
+                        let word = heap.get(ordinal).ok_or(Error::Corrupt("missing word"))?;
+                        if words.intern(word)? != ordinal {
+                            return Err(Error::Corrupt("heap word ordinal"));
+                        }
+                    }
+                } else if words.word_count() > manifest.heap_words {
+                    return Err(Error::Corrupt("the word store has more words than the heap"));
+                }
+            }
+            if !matches!(plan, Plan::Same) {
+                // the heap words: those of the manifest, loaded either from the heap or from the epoch that was committed
+                word_bytes = words.heap().byte_len_of(manifest.heap_words);
+            }
+            *self.epochs.write().ignore_poison() = Epochs { committing: committing_epoch, live: live_epoch };
+            word_bytes
+        };
+        let mut frames = self.frames.write().ignore_poison();
+        for (id, (meta, (segments, committing, pending))) in manifest.frames.iter().zip(updates).enumerate() {
             let frame = match frames.get(id) {
                 Some(frame) => frame.clone(),
                 None => {
-                    let state = FrameState {
-                        segments: Arc::new(Vec::new()),
-                        committed_rows: 0,
-                        next_segment: 0,
-                        pending: Arc::new(Pending::memory(&meta.schema, &self.words, &self.options)),
-                    };
+                    let empty = Pending::memory(&meta.schema, &self.words, &self.options);
                     let frame = Arc::new(Frame {
                         id,
                         name: meta.name.clone(),
@@ -1743,7 +2329,7 @@ impl Shared {
                         words: self.words.clone(),
                         writable: self.writable.clone(),
                         write_mutex: self.write_mutex.clone(),
-                        state: RwLock::new(state),
+                        state: RwLock::new(FrameState::new(Vec::new(), 0, 0, empty)),
                         shared: OnceLock::new(),
                     });
                     if let Some(me) = self.me.get() {
@@ -1753,62 +2339,25 @@ impl Shared {
                     frame
                 }
             };
-            let mut state = frame.state.write().expect("frame lock poisoned");
-            if meta.segments.len() < state.segments.len() {
-                return Err(Error::Corrupt("the manifest lost segments"));
-            }
-            if meta.segments.len() > state.segments.len() {
-                let mut segments: Vec<Arc<Segment>> = state.segments.iter().cloned().collect();
-                let mut start = state.committed_rows;
-                for segment in &meta.segments[segments.len()..] {
-                    segments.push(Arc::new(open_segment(
-                        &self.dir,
-                        segment,
-                        meta.schema.len(),
-                        start,
-                        &self.options,
-                        &self.segment_files,
-                    )?));
-                    start += segment.rows;
-                }
-                state.segments = Arc::new(segments);
-                state.committed_rows = start;
+            let mut state = frame.state.write().ignore_poison();
+            if let Some((segments, rows)) = segments {
+                state.segments = segments;
+                state.committed_rows = rows;
             }
             state.next_segment = meta.next_segment;
-            // a new epoch, a new dataframe, or one whose pending files did not exist yet when it was opened
-            let reopen = !same_epoch || is_new || (epoch.is_some() && matches!(state.pending.buffer, Buffer::Memory(_)));
-            if reopen {
-                state.pending = Arc::new(Pending::open(epoch.as_ref(), id, &meta.schema, &self.words, &self.options)?);
+            if let Some(committing) = committing {
+                state.committing = committing;
+            }
+            if let Some(pending) = pending {
+                state.pending = pending;
             }
         }
-        if manifest.sealed {
-            let mut table = self.word_table.write().expect("word table lock poisoned");
-            let path = self.dir.join("words.idx");
-            if table.is_none() && path.exists() {
-                *table = Some(WordTable::open(&path)?);
-            }
+        drop(frames);
+        if let Some(table) = table {
+            *self.word_table.write().ignore_poison() = Some(table);
         }
-        // The words committed since they were loaded, and the switch to the new epoch, under the word store lock (see
-        // load_pending_words).
-        let mut words = self.words.write().expect("word store lock poisoned");
-        let mut word_bytes = self.committed.lock().expect("commit lock poisoned").word_bytes;
-        if !same_epoch {
-            if words.word_count() < manifest.heap_words {
-                let heap = read_heap(&self.dir.join("heap.bin"), manifest.heap_bytes, manifest.heap_words)?;
-                for ordinal in words.word_count()..manifest.heap_words {
-                    let word = heap.get(ordinal).ok_or(Error::Corrupt("missing word"))?;
-                    if words.intern(word)? != ordinal {
-                        return Err(Error::Corrupt("heap word ordinal"));
-                    }
-                }
-            } else if words.word_count() > manifest.heap_words {
-                return Err(Error::Corrupt("the word store has more words than the heap"));
-            }
-            word_bytes = words.heap().byte_len();
-        }
-        *self.epoch.write().expect("epoch lock poisoned") = epoch;
-        *self.committed.lock().expect("commit lock poisoned") = Committed::from_manifest(&manifest, word_bytes);
-        Ok(())
+        *self.committed.lock().ignore_poison() = Committed::from_manifest(manifest, word_bytes);
+        Ok(true)
     }
 }
 
@@ -1818,7 +2367,7 @@ fn write_index(
     options: &StoreOptions,
     schema: &Schema,
     src: &dyn RowSource,
-    words: &WordStore,
+    words: &impl WordSource<MemHeap>,
     segment_file: &str,
 ) -> Result<()> {
     let mut bytes = build_index(src, schema, words)?;
@@ -3303,6 +3852,13 @@ mod tests {
                 }
                 std::process::abort();
             }
+            "hold" => {
+                // holds the writer lock until the parent says so
+                std::fs::write(Path::new(dir).join("child-ready"), b"").unwrap();
+                while !Path::new(dir).join("child-release").exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             other => panic!("unknown child role {other}"),
         }
     }
@@ -3386,5 +3942,376 @@ mod tests {
         store.commit().unwrap();
         check_search(&frame, "recovered and committed");
         check_search(&seen, "the reader followed");
+    }
+
+    // --- 0.2.2: locking (DESIGN.md decisions 122 and 124-131) -----------------------------------------------------------
+
+    /// Every row `0..rows` is there, in order, with the values `push` gave it.
+    fn assert_rows(frame: &Frame, rows: u64) {
+        assert_eq!(frame.len(), rows);
+        for n in 0..rows {
+            let row = frame.row(n).unwrap();
+            assert_eq!(row[0], OwnedValue::U64(n), "row {n}");
+            assert_eq!(row[3], OwnedValue::Blob(vec![n as u8; 4]), "row {n}");
+        }
+        let hits = frame.search(&Query::new().equals(0, Value::U64(rows / 2))).unwrap().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(hits, if rows > 0 { vec![rows / 2] } else { vec![] });
+    }
+
+    #[test]
+    fn a_frame_that_outlives_its_store_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        let old = store.create_frame("logs", schema()).unwrap();
+        push(&old, 0);
+        drop(store); // releases the writer lock: the frame must not write any more
+        let row = vec![Value::Null; 5];
+        assert!(matches!(old.push_row(&row), Err(Error::ReadOnly)));
+        let store = Store::open(dir.path(), options()).unwrap();
+        let frame = store.frame("logs").unwrap();
+        // the row survived in mapped mode only (memory buffers end with their store)
+        let kept = if store.shared.options.mapped() { 1 } else { 0 };
+        assert_eq!(frame.len(), kept);
+        push(&frame, kept);
+        assert!(matches!(old.push_row(&row), Err(Error::ReadOnly)));
+        assert_rows(&frame, kept + 1);
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn another_process_sees_the_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Store::create(dir.path(), options()).unwrap().create_frame("indexed", search_schema(true)).unwrap());
+        let mut child = spawn_child("hold", dir.path());
+        let ready = dir.path().join("child-ready");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(std::time::Instant::now() < deadline, "the child did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(Store::open(dir.path(), options()), Err(Error::Locked)));
+        assert!(matches!(Store::build_indexes(dir.path(), options()), Err(Error::Locked)));
+        std::fs::write(dir.path().join("child-release"), b"").unwrap();
+        assert!(child.wait().unwrap().success());
+        Store::open(dir.path(), options()).unwrap();
+    }
+
+    #[test]
+    fn a_seal_releases_the_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), StoreOptions { indexing: false, ..options() }).unwrap();
+        let frame = store.create_frame("logs", search_schema(true)).unwrap();
+        for i in 0..40 {
+            push_search_row(&frame, i);
+        }
+        assert!(matches!(Store::build_indexes(dir.path(), options()), Err(Error::Locked)));
+        store.seal().unwrap();
+        // the sealing store is still alive
+        let report = Store::build_indexes(dir.path(), options()).unwrap();
+        assert_eq!(report.segments_indexed, 1);
+        assert!(matches!(Store::open(dir.path(), options()), Err(Error::ReadOnly)));
+        assert_eq!(frame.len(), 40);
+    }
+
+    #[test]
+    fn a_poisoned_lock_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::create(dir.path(), options()).unwrap());
+        let frame = store.create_frame("logs", schema()).unwrap();
+        push(&frame, 0);
+        let poisoner = store.clone();
+        let _ = std::thread::spawn(move || {
+            let _write = poisoner.shared.write_mutex.lock().unwrap();
+            panic!("a bug while pushing");
+        })
+        .join();
+        assert!(matches!(frame.push_row(&vec![Value::Null; 5]), Err(Error::Corrupt(crate::sync::POISONED))));
+        assert!(matches!(store.commit(), Err(Error::Corrupt(crate::sync::POISONED))));
+        // reads do not need the write mutex
+        assert_rows(&frame, 1);
+    }
+
+    /// Freezes the pending rows like a commit does, without writing them (a commit stopped between its two steps).
+    fn freeze(store: &Store) -> Frozen {
+        let _write = store.shared.write_mutex.lock().unwrap();
+        store.shared.freeze(false, true).unwrap()
+    }
+
+    #[test]
+    fn rows_pushed_during_a_commit_go_to_the_next_one() {
+        for pending in [PendingMode::Mapped, PendingMode::Memory] {
+            if pending == PendingMode::Mapped && !cfg!(feature = "mmap") {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let options = || StoreOptions { pending, ..options() };
+            let store = Store::create(dir.path(), options()).unwrap();
+            let frame = store.create_frame("logs", schema()).unwrap();
+            for id in 0..30 {
+                push(&frame, id);
+            }
+            store.commit().unwrap();
+            for id in 30..50 {
+                push(&frame, id);
+            }
+            let reader = Store::open_read_only(dir.path(), options()).unwrap();
+            let seen = reader.frame("logs").unwrap();
+            let frozen = freeze(&store);
+            // the commit is between its steps: pushes go on into the next buffer and every row stays readable
+            for id in 50..70 {
+                assert_eq!(push(&frame, id), id);
+            }
+            assert_eq!((frame.pending_rows(), store.pending_rows()), (40, 40));
+            assert_rows(&frame, 70);
+            if pending == PendingMode::Mapped {
+                // a reader in another store follows the writer into the next epoch
+                assert_rows(&seen, 70);
+            }
+            store.shared.finish(&frozen).unwrap();
+            assert_eq!(frame.pending_rows(), 20);
+            assert_rows(&frame, 70);
+            if pending == PendingMode::Mapped {
+                assert_rows(&seen, 70);
+            }
+            store.commit().unwrap();
+            assert_rows(&frame, 70);
+            drop(store);
+            let reopened = Store::open_read_only(dir.path(), options()).unwrap();
+            assert_rows(&reopened.frame("logs").unwrap(), 70);
+            if pending == PendingMode::Mapped {
+                assert_rows(&seen, 70);
+            }
+        }
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn a_commit_interrupted_between_its_steps_is_finished_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        let frame = store.create_frame("logs", schema()).unwrap();
+        for id in 0..25 {
+            push(&frame, id);
+        }
+        let _frozen = freeze(&store);
+        for id in 25..40 {
+            push(&frame, id);
+        }
+        // a reader opened now finds both epochs
+        let reader = Store::open_read_only(dir.path(), options()).unwrap();
+        assert_rows(&reader.frame("logs").unwrap(), 40);
+        drop((frame, store)); // the process dies before the second step
+        let store = Store::open(dir.path(), options()).unwrap();
+        assert_eq!(store.recovery().pending_rows, 40);
+        let frame = store.frame("logs").unwrap();
+        // the frozen rows were committed at open; the later ones are pending
+        assert_eq!(frame.pending_rows(), 15);
+        assert_eq!(read_manifest(dir.path()).unwrap().frames[0].segments.len(), 1);
+        assert_rows(&frame, 40);
+        assert_rows(&reader.frame("logs").unwrap(), 40);
+        for id in 40..45 {
+            push(&frame, id);
+        }
+        store.commit().unwrap();
+        assert_rows(&frame, 45);
+        // only the files of the current epoch are left
+        let epochs: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".hdr"))
+            .collect();
+        assert_eq!(epochs.len(), 1, "{epochs:?}");
+    }
+
+    /// Makes `dir` read-only for the duration of `f`; `false` if the user can write there anyway (root).
+    #[cfg(unix)]
+    fn with_read_only_dir(dir: &Path, f: impl FnOnce()) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let probe = dir.join("probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return false;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_commit_keeps_its_rows_and_the_next_commit_finishes_it() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("store");
+        let pending_dir = if cfg!(feature = "mmap") { Some(root.path().join("pending")) } else { None };
+        let options = || StoreOptions { pending_dir: pending_dir.clone(), ..options() };
+        let store = Store::create(&dir, options()).unwrap();
+        let frame = store.create_frame("logs", schema()).unwrap();
+        for id in 0..20 {
+            push(&frame, id);
+        }
+        store.commit().unwrap();
+        for id in 20..35 {
+            push(&frame, id);
+        }
+        let ran = with_read_only_dir(&dir, || {
+            // the segment cannot be created: the commit fails after its freeze
+            assert!(store.commit().is_err());
+            for id in 35..40 {
+                push(&frame, id);
+            }
+            assert_rows(&frame, 40);
+            assert_eq!(frame.pending_rows(), 20);
+            // a seal runs whole and is undone
+            assert!(store.seal().is_err());
+            assert!(store.is_writable());
+            push(&frame, 40);
+            assert_rows(&frame, 41);
+        });
+        if !ran {
+            return; // root ignores the permissions
+        }
+        store.commit().unwrap();
+        assert_rows(&frame, 41);
+        assert_eq!(read_manifest(&dir).unwrap().frames[0].segments.len(), 3);
+        store.seal().unwrap();
+        drop(store);
+        assert_rows(&Store::open_read_only(&dir, options()).unwrap().frame("logs").unwrap(), 41);
+    }
+
+    #[test]
+    fn pushes_and_commits_on_other_threads_keep_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::create(dir.path(), options()).unwrap());
+        let frame = store.create_frame("logs", schema()).unwrap();
+        let reader = Store::open_read_only(dir.path(), options()).unwrap();
+        let seen = reader.frame("logs").unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let committer = {
+            let (store, done) = (store.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut commits = 0;
+                while !done.load(Ordering::Acquire) {
+                    store.commit().unwrap();
+                    commits += 1;
+                }
+                commits
+            })
+        };
+        let watcher = {
+            let (seen, done) = (seen.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut last = 0;
+                while !done.load(Ordering::Acquire) {
+                    let len = seen.len();
+                    assert!(len >= last, "a reader saw rows disappear");
+                    if len > 0 {
+                        assert_eq!(seen.row(len - 1).unwrap()[0], OwnedValue::U64(len - 1));
+                    }
+                    last = len;
+                }
+            })
+        };
+        for id in 0..1500 {
+            assert_eq!(push(&frame, id), id);
+        }
+        done.store(true, Ordering::Release);
+        assert!(committer.join().unwrap() > 0);
+        watcher.join().unwrap();
+        store.commit().unwrap();
+        assert_rows(&frame, 1500);
+        if store.shared.options.mapped() {
+            assert_rows(&seen, 1500);
+        }
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn a_reader_that_read_an_outdated_manifest_follows_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(dir.path(), options()).unwrap();
+        let frame = store.create_frame("logs", schema()).unwrap();
+        push(&frame, 0);
+        store.commit().unwrap();
+        let outdated = std::fs::read(dir.path().join("manifest")).unwrap();
+        push(&frame, 1);
+        store.commit().unwrap(); // deletes the pending files the outdated manifest names
+        let current = std::fs::read(dir.path().join("manifest")).unwrap();
+        // a reader that read the manifest just before that commit and opened its pending files just after
+        std::fs::write(dir.path().join("manifest"), &outdated).unwrap();
+        let reader = Store::open_read_only(dir.path(), options()).unwrap();
+        std::fs::write(dir.path().join("manifest"), &current).unwrap();
+        let seen = reader.frame("logs").unwrap();
+        push(&frame, 2);
+        store.commit().unwrap();
+        push(&frame, 3);
+        assert_rows(&seen, 4);
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn a_copied_store_with_a_shared_pending_dir_gets_pending_files_of_its_own() {
+        let root = tempfile::tempdir().unwrap();
+        let shared_dir = root.path().join("shm");
+        let options = || StoreOptions { pending_dir: Some(shared_dir.clone()), ..options() };
+        let copy_folder = |from: &Path, to: &Path| {
+            std::fs::create_dir(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap().flatten() {
+                std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            }
+        };
+        let (a, b) = (root.path().join("a"), root.path().join("b"));
+        let store = Store::create(&a, options()).unwrap();
+        let frame = store.create_frame("logs", schema()).unwrap();
+        push(&frame, 0);
+        store.commit().unwrap();
+        push(&frame, 1);
+        // a copy made while the original runs
+        copy_folder(&a, &b);
+        let copy = Store::open(&b, options()).unwrap();
+        assert_eq!(copy.recovery(), RecoveryReport { pending_rows: 0, pending_files_missing: true });
+        let copied = copy.frame("logs").unwrap();
+        assert_rows(&copied, 1);
+        push(&frame, 2);
+        push(&copied, 1);
+        push(&copied, 2);
+        copy.commit().unwrap();
+        assert_rows(&frame, 3);
+        assert_rows(&copied, 3);
+        store.commit().unwrap();
+        assert_rows(&frame, 3);
+        push(&frame, 3);
+        drop((frame, store, copied, copy));
+
+        // the original, not running: a copy of it still does not take its pending rows
+        let c = root.path().join("c");
+        copy_folder(&a, &c);
+        let copy = Store::open(&c, options()).unwrap();
+        assert!(copy.recovery().pending_files_missing);
+        assert_rows(&copy.frame("logs").unwrap(), 3);
+        drop(copy);
+        let store = Store::open(&a, options()).unwrap();
+        assert_eq!(store.recovery().pending_rows, 1);
+        assert_rows(&store.frame("logs").unwrap(), 4);
+        drop(store);
+
+        // a moved store keeps its pending rows
+        let moved = root.path().join("moved");
+        std::fs::rename(&a, &moved).unwrap();
+        let store = Store::open(&moved, options()).unwrap();
+        assert_eq!(store.recovery(), RecoveryReport { pending_rows: 1, pending_files_missing: false });
+        assert_rows(&store.frame("logs").unwrap(), 4);
+        store.seal().unwrap();
+        // the seal deletes the pending files and the lock file of the store
+        let left: Vec<_> = std::fs::read_dir(&shared_dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(
+            left.iter().all(|n| !n.to_string_lossy().contains(&format!("{:032x}", read_manifest(&moved).unwrap().store_id))),
+            "{left:?}"
+        );
     }
 }

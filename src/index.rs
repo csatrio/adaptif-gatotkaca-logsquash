@@ -92,8 +92,28 @@ pub(crate) fn compress_index(raw: &[u8], level: i32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The word store an index build reads: borrowed for the whole build, or a shared one locked again for each entry, so a
+/// commit that builds an index does not hold up the inserts that add words meanwhile (DESIGN.md 14.17). The words a build
+/// needs are older than the rows it indexes and never change.
+pub(crate) trait WordSource<H: Heap> {
+    fn with_words<R>(&self, f: impl FnOnce(&WordStore<H>) -> Result<R>) -> Result<R>;
+}
+
+impl<H: Heap> WordSource<H> for WordStore<H> {
+    fn with_words<R>(&self, f: impl FnOnce(&WordStore<H>) -> Result<R>) -> Result<R> {
+        f(self)
+    }
+}
+
+impl<H: Heap> WordSource<H> for std::sync::RwLock<WordStore<H>> {
+    fn with_words<R>(&self, f: impl FnOnce(&WordStore<H>) -> Result<R>) -> Result<R> {
+        use crate::sync::Unpoison;
+        f(&*self.read().or_poisoned()?)
+    }
+}
+
 /// Builds the index file of a segment from its rows, wherever they are (the buffer they are written from, or a written segment).
-pub(crate) fn build_index<H: Heap>(src: &dyn RowSource, schema: &Schema, words: &WordStore<H>) -> Result<Vec<u8>> {
+pub(crate) fn build_index<H: Heap>(src: &dyn RowSource, schema: &Schema, words: &impl WordSource<H>) -> Result<Vec<u8>> {
     let mut tables: Vec<(u32, u8, BTreeMap<u64, Vec<u32>>)> = Vec::new();
     let mut fold_of: HashMap<u32, u64> = HashMap::new();
     for (c, column) in schema.columns().iter().enumerate() {
@@ -124,20 +144,25 @@ pub(crate) fn build_index<H: Heap>(src: &dyn RowSource, schema: &Schema, words: 
                         info.ordinals.sort_unstable();
                         info.ordinals.dedup();
                     }
-                    if want_fold {
-                        for &ordinal in &info.ordinals {
-                            let word = words.get(ordinal).ok_or(Error::Corrupt("unknown word ordinal"))?;
-                            info.folds.push(*fold_of.entry(ordinal).or_insert_with(|| fold_hash(word)));
+                    if !(want_fold || want_equal) {
+                        return Ok(());
+                    }
+                    words.with_words(|words| {
+                        if want_fold {
+                            for &ordinal in &info.ordinals {
+                                let word = words.get(ordinal).ok_or(Error::Corrupt("unknown word ordinal"))?;
+                                info.folds.push(*fold_of.entry(ordinal).or_insert_with(|| fold_hash(word)));
+                            }
+                            info.folds.sort_unstable();
+                            info.folds.dedup();
                         }
-                        info.folds.sort_unstable();
-                        info.folds.dedup();
-                    }
-                    if want_equal {
-                        let mut text = Vec::new();
-                        decode_with(words, tail, &mut text)?;
-                        info.text_hash = xxh3(&text, 0);
-                    }
-                    Ok(())
+                        if want_equal {
+                            let mut text = Vec::new();
+                            decode_with(words, tail, &mut text)?;
+                            info.text_hash = xxh3(&text, 0);
+                        }
+                        Ok(())
+                    })
                 })?;
                 slot.insert(info);
             }
@@ -415,7 +440,7 @@ mod tests {
 
     fn built(frame: &DataFrame, shared: &SharedWords) -> SegmentIndex {
         let words = shared.read().unwrap();
-        SegmentIndex::from_vec(frame.with_inner(|i| build_index(&BufferSource::all(i), frame.schema(), &words)).unwrap()).unwrap()
+        SegmentIndex::from_vec(frame.with_inner(|i| build_index(&BufferSource::all(i), frame.schema(), &*words)).unwrap()).unwrap()
     }
 
     #[test]
@@ -446,7 +471,7 @@ mod tests {
         let shared = shared();
         let frame = frame(&shared);
         let words = shared.read().unwrap();
-        let bytes = frame.with_inner(|i| build_index(&BufferSource::all(i), frame.schema(), &words)).unwrap();
+        let bytes = frame.with_inner(|i| build_index(&BufferSource::all(i), frame.schema(), &*words)).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.idx");
         write_new_file(&path, &bytes).unwrap();
@@ -475,7 +500,7 @@ mod tests {
         let shared = shared();
         let frame = frame(&shared);
         let words = shared.read().unwrap();
-        let raw = frame.with_inner(|i| build_index(&BufferSource::all(i), frame.schema(), &words)).unwrap();
+        let raw = frame.with_inner(|i| build_index(&BufferSource::all(i), frame.schema(), &*words)).unwrap();
         let packed = compress_index(&raw, 3).unwrap();
         assert!(packed.len() < raw.len());
         let dir = tempfile::tempdir().unwrap();

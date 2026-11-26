@@ -7,6 +7,7 @@
 use crate::error::{Error, Result};
 use crate::heap::{Heap, MemHeap};
 use crate::splitter::Splitter;
+use crate::sync::Unpoison;
 use crate::varint;
 use crate::words::{SharedWords, WordStore};
 use base64::Engine;
@@ -108,7 +109,7 @@ impl<H: Heap> Tokenizer<H> {
 
     /// Encodes `text` and appends its stream to `out`. If this fails, no word of `text` stays in the store.
     pub fn encode(&self, text: &str, splitter: &dyn Splitter, out: &mut BytesMut) -> Result<()> {
-        let mut words = self.words.write().expect("word store lock poisoned");
+        let mut words = self.words.write().or_poisoned()?;
         let checkpoint = words.checkpoint();
         let result = self.encode_with(&mut words, text, splitter, out);
         if result.is_err() {
@@ -174,7 +175,7 @@ impl<H: Heap> Tokenizer<H> {
 
     /// Decodes the stream at the start of `stream`, appends the text to `out` and returns the bytes consumed.
     pub fn decode(&self, stream: &[u8], out: &mut impl BufMut) -> Result<usize> {
-        let words = self.words.read().expect("word store lock poisoned");
+        let words = self.words.read().or_poisoned()?;
         decode_with(&words, stream, out)
     }
 
