@@ -334,6 +334,12 @@ A store is a **folder** covering one day or other time period. All its dataframe
 | 131 | Poisoned locks? | A panic while a lock is held (a bug, running out of memory) can leave the state behind it half-changed. Calls that return a `Result` fail with `Error::Corrupt("a call panicked while it held a lock of this store; open the store again")` instead of panicking in turn (`src/sync.rs`). Calls without a `Result` (counters such as `len`), caches, and switch-overs made of whole assignments take the guard anyway. |
 | 132 | Network file systems? | Not supported: a store and its `pending_dir` must be on a local file system (or tmpfs). Locks may not reach other hosts, and mapped files are not coherent between hosts. |
 | 133 | 0.2.2? | A patch release dated 2026-11-27 with decisions 122 and 124 to 132. Formats unchanged: the epoch header uses a slot that was zero before (`NEXT`, 14.17). |
+| 134 | v3 (planned): what does `working_memory` bound? | The memory a store keeps to read committed data again faster: decoded segment blocks, row-heap blocks, word heap blocks, index pages, the writer's hot word cache, readers' pending indexes. One budget per open store, default 16 MiB, configurable; a budget larger than the data evicts nothing. Not counted: memory-mapped files (the OS page cache reclaims them), pending data and its write-side structures (bounded by the commit policy), small fixed directories, and what running calls hold (15.3). |
+| 135 | v3 (planned): paging the word heap? | A block cache: a directory of `heap.bin` records (20 bytes per block, read at open without decompressing) maps an ordinal to its block, loaded through the store cache. New folders write 64 KiB heap blocks instead of 1 MiB, so a cached word costs a small block (15.5). |
+| 136 | v3 (planned): word to ordinal without a dictionary in RAM? | `words.hix`: immutable sorted runs of `(xxh3-128 key, ordinal)` with a Bloom filter, one run per commit, merged in tiers, listed in the manifest and memory-mapped. Keys are compared without reading the word text (collision probability about 2^-65 at 2^32 words); a text check would load a heap block per lookup on the push path (15.6). For review. |
+| 137 | v3 (planned): the writer's dictionary? | Paged too: pending words in RAM, then a hot word cache in the budget, then `words.hix`. `dictionary_bytes` and `Error::DictionaryFull` go; a folder holds up to 2^32 words (15.7). |
+| 138 | v3 (planned): index files? | A paged index format: directory and posting lists in independently compressed pages of about 64 KiB with a small page table read at open, loaded through the cache. Older compressed index files are read whole as one cache entry (15.9). |
+| 139 | v3 (planned): release? | 0.3.0, breaking: `StoreOptions::working_memory` added; `cache_bytes`, `dictionary_bytes`, `Error::DictionaryFull` and `Store::words()` removed; `heap_block_bytes` defaults to 64 KiB. Format 3 (the manifest lists the `words.hix` runs); format 1 and 2 folders are read and upgraded at the first writable open (15.10, 15.11). Planned only: awaiting review before any code. |
 | (note) | Folder = period | A folder covers a day or other period and is shared by all its dataframes; on rotation the dictionary is dropped, the heap and indexes stay. |
 
 ## 9. Open Questions
@@ -490,7 +496,7 @@ The 1 MiB default makes the whole corpus 25.5% of raw with every index (segments
 Things the benchmarks make visible: a phrase made of very common words (or single characters) falls back to verifying many rows and takes tens of milliseconds, and a single-character word always scans.
 - **Version 2 done (0.2.0, section 14):** `mapped` (counter files, chunked regions), `pending` (epochs, words mirror, mapped writer, recovery, mapped source), `RowEncoder`, `SegmentInput`, views and live readers in `store`, `CommitPolicy` and `commit_if_due`. 124 tests pass with the default features (5 runs in a row) and 102 without `mmap`; clippy is clean both ways. The push benchmark is in 14.16.
 - **0.2.2 (locking, decisions 122 and 124 to 133):** POSIX writer locks with a process-wide table (`lock`), lock poisoning as errors (`sync`), frames that outlive their store, copies in a shared `pending_dir` (14.18), the two-step commit (14.17), readers that read an outdated manifest, `create` checked under the lock, and the seal releasing the lock. 137 tests pass with the default features (5 runs in a row after the last change) and 111 without `mmap`; clippy is clean both ways. The push cost is unchanged (4.1 µs mapped, 3.2 µs memory, 14.16).
-- Next: nothing is planned; remaining work is whatever the user asks for next.
+- **Version 3 planned (section 15):** a working-memory budget per store and paged words. Written for review; no code yet.
 
 ## 14. Version 2: Mapped Pending Buffer and Live Readers
 Status: **implemented in 0.2.0** (breaking, see 14.12). Decisions 101-109 were taken before the implementation, 110-123 during it; where the text below differs from the first plan, it describes what was built.
@@ -721,3 +727,132 @@ With a `pending_dir` outside the folder, the pending files of many stores share 
 
 A copy reports `pending_files_missing`, gets no pending rows and a new store id at once. A commit that moves to another directory or id takes the new lock first and releases (and deletes) the old one after; the seal deletes it.
 
+## 15. Version 3: Working-Memory Budget and Paged Words (planned)
+Status: design for review; nothing is implemented. Decisions 134 to 139.
+
+### 15.1 Goals and non-goals
+Goals:
+- Every open store, writer or read-only, keeps its cache memory under `StoreOptions::working_memory` (default 16 MiB, configurable), however large the folder or its vocabulary.
+- Opening a store no longer reads the whole word heap, so open time and memory no longer grow with the vocabulary.
+- The writer has no dictionary limit: `DictionaryFull` goes, and a folder holds up to 2^32 words. This is what a long-lived folder (for example a document store) needs.
+- With a budget larger than the store's data nothing is evicted: after warm-up, speed is as in 0.2.
+- Results do not depend on the budget: the same query results, the same row numbers, and byte-identical segments and indexes.
+
+Non-goals:
+- Bounding pending data (the rows since the last commit): the commit policy bounds it, and in `Mapped` mode it lives in mapped files (14).
+- Bounding the OS page cache of memory-mapped files.
+- Changing the segment file format or the row-heap layout.
+
+### 15.2 Where memory goes today (0.2)
+| Item | Held | Size | Loaded |
+|---|---|---|---|
+| Word heap (`MemHeap`) | per store | the word bytes, a length prefix and a 4-byte offset per word | at open, all of it |
+| Dictionary | per store | 32 bytes per word, plus an 8-byte key | rebuilt at open by hashing every word |
+| Segment block cache | per segment | up to `cache_bytes` (32 MiB) each, cleared when full | on use |
+| Index file | per segment | the whole file, decompressed (the default `compress_indexes`) | at open |
+| Segment footer index | per segment | about 40 bytes per column block | at open |
+| Pending index | per frame | an index of the pending rows | at a query |
+| Pending rows | per frame | mapped (`Mapped`) or in RAM (`Memory`), up to the commit policy | while writing |
+| Whole-string dedup map | per writer frame | up to `dedup_entries` (4,000,000) entries of about 40 bytes | while writing |
+
+Two million words cost about 100 MB in every store that opens the folder, and a store with 20 segments may cache up to 640 MB of blocks. On the 775 MB log corpus the words are small (`heap.bin` is 0.73 MB): there the segment caches and the decompressed indexes dominate. A budget is therefore only meaningful if it covers the whole store (decision 134).
+
+### 15.3 The budget
+- `StoreOptions::working_memory: usize`, default 16 MiB. Each open `Store` has its own budget; a process with N stores uses up to N budgets.
+- **Counted:** decoded segment column blocks, row-heap blocks, word heap blocks, index pages, the writer's hot word cache, and readers' pending indexes. All of these can be rebuilt from the files, so they can be evicted.
+- **Not counted:**
+  - Memory-mapped files: uncompressed index files, `words.idx`, `words.hix`, the pending regions. The OS page cache holds them and reclaims them under pressure.
+  - Pending data and its write-side structures: the pending words and their map, the dedup map, the `Memory`-mode buffer. The commit policy and `dedup_entries` bound them.
+  - Fixed directories proportional to the data on disk: segment footers, the heap block directory (20 bytes per heap block), the page tables of index files, the run list of `words.hix`.
+  - What running calls hold (a row being decoded, a result list).
+- **Overshoot:** cache entries are `Arc`s. Eviction drops the cache's reference, while a running read keeps its own, so memory can exceed the budget by what running reads hold (as with the file pool, 7). An entry larger than the whole budget is used but not kept.
+- **A large budget pages nothing:** entries load on first use and stay while the total is under the budget. Nothing is loaded eagerly at open any more, so opening is fast whatever the budget.
+- `Store::memory_in_use()` reports the bytes in the cache, for monitoring and tests.
+
+### 15.4 The store cache
+- One cache per store, shared by its segments, its word heap and its indexes. Keys are `(kind, owner, number)`: a column block `(segment, block, column)`, a row-heap block `(segment, block)`, a word block `(heap block)`, an index page `(segment, page)`, and hot words.
+- Eviction uses CLOCK (second chance), an approximation of LRU, over shards selected by key hash (16 shards, each with a sixteenth of the budget), so parallel readers rarely meet on one lock. Hot words are counted per entry.
+- `SegmentReader` loses its own cache and its `cache_limit` and uses the store cache instead; `cache_bytes` goes.
+
+### 15.5 Ordinal to word: the paged heap
+- **At open:** read the record headers of `heap.bin` (20 bytes each, up to the committed length) into a block directory `(first ordinal, file offset, compressed length, raw length, word count)`. Nothing is decompressed; a block's checksum is checked when the block is loaded, and by `verify`.
+- **Lookup:** binary-search the directory for the block, then get it through the cache. Loading a block decompresses it, checks its checksum, and builds its word offsets. A cache entry costs the raw bytes plus 4 bytes per word.
+- **Pending words** (ordinals at or above the committed count) stay in RAM as today. The writer appends them as rows are pushed; a reader loads them from the epoch's words region (14.7). The commit that writes them to `heap.bin` drops them; with the two-step commit (14.17), frozen pending words stay readable until the manifest is written.
+- **Block size:** `heap_block_bytes` defaults to 64 KiB instead of 1 MiB, so a cached word costs a small block. `heap.bin` is small, so the compression lost should be negligible (to be measured). Existing folders keep their 1 MiB blocks: still correct, only coarser.
+- **Access:** callers get a `WordRef` (an `Arc` of the block plus a range, which dereferences to `str`), not a `&str`. Hot loops (decoding a row, verifying a phrase, building an index) use a `WordReader` that keeps the last few blocks it used, so a row costs one cache lookup per distinct block, not per word.
+- **Locality:** ordinals are given in first-seen order, so the frequent words of a folder have low ordinals, sit in the first blocks and stay cached. A rare word costs one block load on first use.
+
+### 15.6 Word to ordinal: `words.hix`
+- **Who needs it:** the writer, for every pushed word (is it known, and what is its ordinal?), and readers, for `word` and `phrase` queries, which map the query words to ordinals because the word index is keyed by ordinal. Case-insensitive and equality queries use hashes and need no ordinal.
+- **Files:** immutable sorted runs `words-<nnnnnn>.hix`, listed in the manifest. Like segments, they are written before the manifest that lists them and deleted once a manifest no longer lists them.
+- **Format:** a header, a blocked Bloom filter (10 bits per word, about 1% false positives), the entries sorted by key (`u128` xxh3-128 of the word bytes, then `u32` ordinal: 20 bytes per word), and a checksum. Runs are memory-mapped: a lookup touches one cache line of the Bloom filter and the pages of one binary search.
+- **No text check** (decision 136, for review): two words are taken as equal when their 128-bit keys are equal. At 2^32 words the probability of any collision is about 2^-65 (birthday bound n² / 2^129). Checking the text would load a heap block for each lookup on the push path. The 0.2 dictionary (64-bit keys, a text check, salt probing) is kept only for the pending words.
+- **Runs and merging:** each commit writes one run of its new words. When more than 4 runs have similar sizes (within a factor of 4), that commit merges them into one (a k-way merge of mapped files). A folder then has O(log n) runs: at most about 12, usually 2 to 5. A lookup checks the newest run first: its Bloom filter, then a binary search.
+- `words.idx` (sorted by bytes, written at the seal) stays, for prefix suggestions.
+
+### 15.7 The writer
+- **Interning a word:** look in (1) the pending words (an in-RAM map of the words since the last commit), (2) the hot word cache (key to ordinal, in the budget: the frequent words), (3) the `words.hix` runs. A word found nowhere is appended as a new pending word.
+- **Memory:** the pending words and their map are bounded by the commit policy (they count in `pending_bytes`); everything else is in the budget.
+- **Limits:** `dictionary_bytes` and `Error::DictionaryFull` go. `HeapFull` remains only at 2^32 - 1 words (block offsets are `u64`).
+- **Open:** a writable open no longer rebuilds a dictionary; `words.hix` replaces it. A format 2 folder gets its runs at its first writable open (one streaming pass over `heap.bin`, sorted in bounded chunks and merged), as part of the upgrade commit.
+- **Recovery:** pending words are loaded from the epoch's words region as today (14.8). Rolling back a failed row truncates the pending words as today; only pending words can be new.
+- **Commit:** the frozen pending words go to `heap.bin` (64 KiB blocks) and to a new run, both before the manifest (14.17), and the words that became committed enter the hot word cache.
+- **Dedup map:** the whole-string dedup map is pending-side memory and stays as it is: its cap is deterministic, which keeps segments byte-identical. Its 4,000,000-entry default (about 160 MB at worst) is an open point (15.15).
+
+### 15.8 Readers
+- **Open:** read the manifest, the heap block directory and the run list, and map the runs. Segments open lazily as today. No word is loaded.
+- **Following a writer:** the pending words of the epoch go to the pending words, bounded by the writer's commit policy. On a commit, the reader reads the headers of the new heap blocks, maps the new runs, and drops the pending words that became committed.
+- **Queries** look up their words in the pending words, then in the runs.
+
+### 15.9 Segments and indexes
+- **Segment blocks** go through the store cache (15.4).
+- **Index files:** today a compressed index (the default) is decompressed whole at open and kept. v3 writes paged index files (`LSQIDXP1`): the directory and the posting lists in independently zstd-compressed pages of about 64 KiB, plus a small page table (the first key of each directory page and the page offsets) read at open. A lookup loads one directory page and the posting pages it needs through the cache. Uncompressed index files (`compress_indexes: false`) stay memory-mapped.
+- **Older index files:** a compressed file is read whole as one evictable cache entry. Rewriting them in the paged format through `Store::build_indexes` is an open point.
+- Readers' **pending indexes** become cache entries, keyed by frame and row count.
+
+### 15.10 API changes (0.3.0, breaking)
+- Added: `StoreOptions::working_memory: usize` (default `16 << 20`) and `Store::memory_in_use()`.
+- Removed: `StoreOptions::cache_bytes` (replaced by the budget), `StoreOptions::dictionary_bytes`, `Error::DictionaryFull`, and `Store::words()`, which handed out the in-RAM word store.
+- Changed: the default `heap_block_bytes` becomes 64 KiB.
+- Unchanged: `Store::lookup_word` and `words_with_prefix`. The standalone in-memory types (`DataFrame`, `WordStore`, `MemHeap`, `Dictionary`, `Tokenizer`) stay for in-memory use and the tools; the store uses its own paged word store internally.
+
+### 15.11 Formats and compatibility
+- **Format 3:** the manifest lists the `words.hix` runs. `heap.bin` and the segment format do not change (the block size is already recorded per block). Index files gain the paged variant, and the old ones stay readable.
+- **Format 1 and 2 folders** are read:
+  - A writable open upgrades them: it builds the runs and commits.
+  - A sealed folder has `words.idx`, so a reader maps query words through it: a binary search over ordinals sorted by bytes, each probe through the paged heap.
+  - A reader of an unsealed format 2 folder has no word map on disk and loads the words as 0.2 did, without the budget, until a writer upgrades the folder; `Store::build_indexes` can also build the runs.
+- 0.2 cannot read format 3 folders.
+
+### 15.12 What to measure, before and after
+- Open time and memory of large-vocabulary folders (synthetic, 2 million and 20 million words).
+- `push_row`: 4.1 µs per row today. Target: within twice that with a warm hot cache; also the worst case, where every word is new.
+- A random `row` read, cold and warm, with a 16 MiB budget and with an unlimited one.
+- The query benchmarks (13) with 16 MiB and with an unlimited budget.
+- A reader with a 16 MiB budget scanning the whole corpus: its cache stays under the budget, and its RSS under the budget plus the fixed parts.
+- Sizes: `heap.bin` with 64 KiB blocks, `words.hix` bytes per word (about 21.3), paged index files against the compressed ones.
+
+### 15.13 Tests
+- Identical query results and byte-identical segments and indexes across budgets (64 KiB, 16 MiB, unlimited). The ground-truth tests run with a tiny budget, which forces eviction everywhere.
+- The cache: eviction, an entry larger than the budget, concurrent readers, `memory_in_use() <= working_memory` after each call.
+- `words.hix`: runs, merges, Bloom false positives, many runs, a crash between writing a run and writing the manifest (stray runs removed at open), the upgrade of a format 2 folder.
+- A writer storing more words than the 0.2 dictionary held (no `DictionaryFull`).
+- A reader following a writer across commits with a tiny budget; the cross-process and killed-writer tests with a tiny budget.
+
+### 15.14 Implementation steps
+1. The store cache (`cache.rs`): segment blocks go through it and `cache_bytes` goes. Tests with a tiny budget.
+2. The heap block directory and paged ordinal-to-word lookups (`WordRef`, `WordReader`), and moving every reader of words onto them (query, index build, row decoding, tokenizer decoding).
+3. `words.hix`: runs written at commit, merging, manifest format 3, readers' lookups.
+4. The writer: interning through the pending words, the hot cache and the runs; the in-RAM dictionary and `DictionaryFull` removed; the upgrade of format 2 folders at a writable open.
+5. Paged index files.
+6. Readers following a writer, recovery, and the two-step commit with paged words.
+7. Measurements (15.12), docs, 0.3.0.
+
+### 15.15 Risks and open points for review
+- 128-bit key equality without a text check (decision 136).
+- The budget does not cover mapped files or pending data. Page cache use is file-backed and reclaimable, but a process's RSS can still exceed 16 MiB per store.
+- `push_row` slows down on vocabulary-heavy data: a new word misses everywhere and checks the Bloom filter of every run.
+- A reader of an unsealed format 2 folder loads every word until the folder is upgraded.
+- The dedup map default (4,000,000 entries, about 160 MB at worst on a writer): lower it, or derive it from the budget? Either changes the bytes of new segments, never correctness.
+- CLOCK against exact LRU, and the number of shards.
+- Rewriting old compressed index files in the paged format (15.9).
