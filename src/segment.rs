@@ -17,6 +17,7 @@ use crate::heap::Heap;
 use crate::schema::Schema;
 use crate::types::OwnedValue;
 use crate::words::WordStore;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -134,23 +135,67 @@ impl<W: Write> BlockWriter<W> {
     }
 }
 
+/// The rows a segment is written from: the in-memory buffer of a dataframe or a mapped pending buffer.
+pub(crate) trait SegmentInput {
+    fn rows(&self) -> u64;
+    fn columns(&self) -> usize;
+    /// The cell of a row and whether it is null.
+    fn cell(&self, row: u64, column: usize) -> Result<(u64, bool)>;
+    /// Number of row-heap blocks.
+    fn heap_blocks(&self) -> usize;
+    /// The logical start offset and the bytes of a row-heap block (an entry never crosses a block).
+    fn heap_block(&self, index: usize) -> Result<(u64, Cow<'_, [u8]>)>;
+}
+
+impl SegmentInput for Inner {
+    fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.columns.len()
+    }
+
+    fn cell(&self, row: u64, column: usize) -> Result<(u64, bool)> {
+        let data = self.columns.get(column).ok_or(Error::ColumnOutOfRange)?;
+        Ok((*data.cells.get(row as usize).ok_or(Error::RowOutOfRange)?, data.nulls.get(row as usize)))
+    }
+
+    fn heap_blocks(&self) -> usize {
+        self.block_starts.len()
+    }
+
+    fn heap_block(&self, index: usize) -> Result<(u64, Cow<'_, [u8]>)> {
+        let start = self.block_starts[index];
+        let end = self.block_starts.get(index + 1).copied().unwrap_or(self.row_heap.len() as u64);
+        Ok((start, Cow::Borrowed(&self.row_heap[start as usize..end as usize])))
+    }
+}
+
 /// Writes the buffered rows of a dataframe as a segment file and syncs it to disk.
-pub(crate) fn write_segment(path: &Path, data: &Inner, options: WriteOptions) -> Result<()> {
+pub(crate) fn write_segment(path: &Path, data: &dyn SegmentInput, options: WriteOptions) -> Result<()> {
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     let mut writer = BlockWriter { out: std::io::BufWriter::new(file), pos: 0, level: options.zstd_level };
     writer.out.write_all(MAGIC)?;
     writer.pos = MAGIC.len() as u64;
 
     let block_rows = options.block_rows.max(1);
-    let rows = data.rows as usize;
-    let columns = data.columns.len();
+    let rows = data.rows() as usize;
+    let columns = data.columns();
     let mut column_blocks = Vec::new();
     let mut payload = Vec::new();
+    let mut cells = Vec::with_capacity(block_rows.min(rows));
+    let mut nulls = Vec::with_capacity(block_rows.min(rows));
     for first in (0..rows).step_by(block_rows) {
         let last = (first + block_rows).min(rows);
-        for column in &data.columns {
-            let cells = &column.cells[first..last];
-            let nulls: Vec<bool> = (first..last).map(|row| column.nulls.get(row)).collect();
+        for column in 0..columns {
+            cells.clear();
+            nulls.clear();
+            for row in first..last {
+                let (cell, null) = data.cell(row as u64, column)?;
+                cells.push(cell);
+                nulls.push(null);
+            }
             let has_nulls = nulls.iter().any(|&n| n);
             payload.clear();
             payload.push(u8::from(has_nulls));
@@ -171,12 +216,12 @@ pub(crate) fn write_segment(path: &Path, data: &Inner, options: WriteOptions) ->
     }
 
     let mut heap_blocks = Vec::new();
-    for (i, &start) in data.block_starts.iter().enumerate() {
-        let end = data.block_starts.get(i + 1).copied().unwrap_or(data.row_heap.len() as u64);
-        heap_blocks.push((start, writer.put(&data.row_heap[start as usize..end as usize])?));
+    for i in 0..data.heap_blocks() {
+        let (start, bytes) = data.heap_block(i)?;
+        heap_blocks.push((start, writer.put(&bytes)?));
     }
 
-    let index = Index { rows: data.rows, block_rows: block_rows as u32, columns: columns as u32, column_blocks, heap_blocks };
+    let index = Index { rows: data.rows(), block_rows: block_rows as u32, columns: columns as u32, column_blocks, heap_blocks };
     let raw = index.encode();
     let comp = zstd::bulk::compress(&raw, options.zstd_level)?;
     let index_offset = writer.pos;

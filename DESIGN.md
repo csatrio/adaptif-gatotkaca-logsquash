@@ -91,7 +91,7 @@ Because the Dictionary stores only hashes, a hit is verified against the heap by
 ### 5.4 Locking
 The Heap and Dictionary live together behind one `RwLock` inside a `Store` (one folder), shared as `Arc<Store>`.
 - Lookups and hydration take the read lock; inserting a new word takes the write lock after a read-locked miss, re-checking under the write lock.
-- **One writer at a time per folder.** A single `Store` write mutex serializes everything that writes: `push_row` on any dataframe, `create_frame` and `commit`. So a commit never overlaps an insert, and a folder is written by one thread at a time (and one process at a time, through the writer file lock). Reads (`row`, `search`, ...) do not take the mutex and run in parallel with each other and with a writer. Lock order is: write mutex, then dataframe lock, then the word store lock. The segment file pool lock (7) is a leaf: it may be taken under the locks above, but no lock is taken while it is held, and it is never taken while a segment file or block cache lock is held.
+- **One writer at a time per folder.** A single `Store` write mutex serializes everything that writes: `push_row` on any dataframe, `create_frame` and `commit`. So a commit never overlaps an insert, and a folder is written by one thread at a time (and one process at a time, through the writer file lock). Reads (`row`, `search`, ...) do not take the mutex and run in parallel with each other and with a writer. Lock order is: write mutex, then dataframe lock, then (v2) the mapped writer mutex of the dataframe, then the word store lock. The epoch pointer of a store is taken after the word store (14.7). The segment file pool lock (7) is a leaf: it may be taken under the locks above, but no lock is taken while it is held, and it is never taken while a segment file or block cache lock is held.
 - Insert throughput is not a goal, so there is no sharding or per-row batching.
 
 ## 6. Dataframe
@@ -190,7 +190,7 @@ A store is a **folder** covering one day or other time period. All its dataframe
   <frame>-000000.idx  its persisted search index (6.5), memory-mapped for reads
   <frame>-000001.seg  ...
 ```
-- **Append-only files, manifest as commit point.** `commit()` writes, in order: the new words as blocks appended to `heap.bin` (each block `[u32 compressed length][u32 raw length][u32 word count][u64 xxh3 checksum][zstd bytes]`, after the 8-byte magic `LSQHEAP1`), then one new segment file per dataframe with buffered rows, then atomically replaces the manifest (write `manifest.tmp`, sync, rename) with the new committed lengths. Every file is synced before the manifest is replaced. On a writable open, anything past the committed `heap.bin` length, segment files the manifest does not list, and `manifest.tmp` are removed. Sealed segments never change. **Rows are only durable after a commit**; rows buffered in memory when the process ends are lost, so callers commit regularly (`commit_if_full`). Automatic commits by byte count (`auto_commit_bytes`) are not implemented.
+- **Append-only files, manifest as commit point.** `commit()` writes, in order: the new words as blocks appended to `heap.bin` (each block `[u32 compressed length][u32 raw length][u32 word count][u64 xxh3 checksum][zstd bytes]`, after the 8-byte magic `LSQHEAP1`), then one new segment file per dataframe with buffered rows, then atomically replaces the manifest (write `manifest.tmp`, sync, rename) with the new committed lengths. Every file is synced before the manifest is replaced. On a writable open, anything past the committed `heap.bin` length, segment files the manifest does not list, and `manifest.tmp` are removed. Sealed segments never change. **Rows are only durable after a commit**; rows buffered in memory when the process ends are lost, so callers commit regularly (`commit_if_full`). Automatic commits by byte count (`auto_commit_bytes`) are not implemented. *(v2, section 14: in `Mapped` mode the pending rows live in memory-mapped files, survive a process crash and are visible to readers; `commit_if_due` commits by rows, bytes or age.)*
 - **Integrity:** every block has an xxh3-64 checksum, verified when read; a mismatch is `Corrupt`. A reader rejects a manifest with a newer format version (`UnsupportedVersion`).
 - **Reuse within a period:** a folder is reopened for appending during its period, so restarts keep sharing one heap and dictionary (Q80). On rotation the caller seals the folder (writes `words.idx` and the final indexes, drops the dictionary) and starts the next one. If the dictionary fills first (`DictionaryFull`), the caller also starts the next folder.
 - **Access:** a writable open takes an exclusive advisory lock on the folder's `lock` file (`fs4`), so only one process writes. **Readers take no lock** (`Store::open_read_only`): committed segments are immutable, `heap.bin` is only ever appended to and read up to the committed length, and the manifest is replaced atomically, so a reader sees a consistent snapshot of the last commit even while a writer is running (this deviates from Q71, which would have blocked the web server's reads while the daily folder is being written). A reader sees new data by reopening. Read-only opens read lazily: only the manifest, `heap.bin` and each segment's footer index are read at open.
@@ -301,6 +301,29 @@ A store is a **folder** covering one day or other time period. All its dataframe
 | 98 | Date/time parsing details? | ISO-8601/RFC-3339, RFC-2822, CLF and strftime; UTC when no offset; errors for finer-than-unit precision, leap seconds, offsets with seconds and out-of-range values; text accepted on insert and in filters. |
 | 99 | Tuned defaults? | Row-heap block 1 MiB (was 64 KiB: -10% total size, random row read about 0.85 ms instead of 0.36 ms); everything else kept (zstd 19, 4,096-row column blocks, 100,000-row segments, inline-run thresholds). A trained zstd dictionary was tried and rejected (see 13). Decoded-block cache is bounded by bytes (`cache_bytes`, 32 MiB per segment). |
 | 100 | Open segment files? | At most 64 per store by default, least recently used closed first and reopened on demand (0.1.2). Set with `Store::set_max_open_segments` rather than a `StoreOptions` field, because adding a field to a struct with only public fields breaks struct literals that list every field (not allowed in a 0.1.x patch). |
+| 101 | v2 durability? | Pending rows survive a process crash only: no `msync`/`fsync` on the pending buffer (page cache outlives the process). Power loss can drop pending rows; commits stay fully synced. |
+| 102 | v2 log format? | No separate write-ahead log: the pending buffer itself lives in memory-mapped, append-only files (cells row-major, row heap, words mirror), so recovery is mapping the files, not replaying a log. |
+| 103 | v2 commit triggers? | Rows (`segment_rows`), pending bytes and age of the oldest pending row, checked by the caller with `Store::commit_if_due` (no background thread). |
+| 104 | v2 live readers? | Yes: read-only stores search pending rows; they refresh automatically at the start of every query (atomic loads; manifest re-read only on an epoch change). |
+| 105 | v2 platforms? | Linux, macOS and Windows: chunk files are never resized; old epoch files are deleted lazily when a reader still maps them. |
+| 106 | v2 mode? | `PendingMode::Mapped` by default; `Memory` (v1) as opt-out and without the `mmap` feature. |
+| 107 | v2 location? | `StoreOptions::pending_dir` (default: the store folder; e.g. `/dev/shm`), recorded in the manifest with a random store id. |
+| 108 | v2 commit of the buffer? | One set of files per epoch; a commit starts a new epoch and deletes the old files instead of resetting them in place, so readers never see a reset. |
+| 109 | v2 version? | 0.2.0 (new `StoreOptions` fields, manifest format 2; v1 manifests are still read). |
+| 110 | v2 row limit of the commit policy? | No `max_rows` in `CommitPolicy`: the row trigger is `segment_rows`, so one setting decides the segment size. |
+| 111 | v2 word count slot? | Dropped: words are length-prefixed and parsed up to the published length. A crash between publishing a row's words and its cells leaves words no row uses; they are valid words and are committed like any other. |
+| 112 | v2 recovery state? | No extra region for row-heap block starts or dedup entries: recovery sorts the distinct row-heap offsets of all cells (they are exactly the entry starts) and replays the push rules. Verified by byte-identical segments after restarts. |
+| 113 | v2 snapshots? | Every read and query works on a view (segments, pending buffer, row count). A commit replaces the pending buffers instead of clearing them, in both modes, so a running search neither skips nor repeats rows. |
+| 114 | v2 `create_frame`? | Writes the manifest at once (no rows), so readers know the schema and frame ids are stable in pending file names. |
+| 115 | v2 without `mmap`? | `PendingMode::Mapped` falls back to `Memory`. A writer that opens a store whose manifest names a mapped epoch fails with `Error::Io` (`Unsupported`) instead of dropping its pending rows; a reader sees the committed rows. |
+| 116 | v2 readers of a `Memory` writer? | Not followed (no epoch header to watch); they reopen to see new commits, as in v1. |
+| 117 | v2 missing pending files? | A writer starts an empty epoch with the same number and reports `pending_files_missing`. A reader with no header checks for it at each query (one `stat`), so it follows a writer that restarts. |
+| 118 | v2 mode or directory change? | A writable open with another `pending` mode or `pending_dir` than the manifest recovers the pending rows and commits them (one small segment), then uses the new setting. A format 1 store is upgraded the same way. |
+| 119 | v2 old epoch files? | Deleted after each commit and at each writable open, by store id; files that cannot be deleted (Windows, a reader still maps them) are retried at the next commit or open. A header of an older epoch gets `superseded_by` first, so its readers move on. |
+| 120 | v2 store id? | 128 bits from xxh3 of the path, time, process and thread ids; it only has to keep stores apart in a shared `pending_dir`. |
+| 121 | v2 version? | 0.2.0, dated 2026-11-27 in the changelog; not published from here. |
+| 122 | Writer lock and spawned children? | A test-only guard (`TEST_SPAWN_GUARD`) keeps a writer lock from being released while a test spawns a child; a forked child holds a copy of the lock file until it executes. Not changed for library users (documented in 14.16). |
+| 123 | CI? | None: the project is built and tested locally only (AGENTS.md). Windows behaviour is covered by tests run there by hand. |
 | (note) | Folder = period | A folder covers a day or other period and is shared by all its dataframes; on rotation the dictionary is dropped, the heap and indexes stay. |
 
 ## 9. Open Questions
@@ -317,7 +340,7 @@ Library crate (`lib.rs`) with modules: `splitter`, `tokenizer`, `heap`, `diction
 | `xxhash-rust` (feature `xxh3`) | xxh3-64 hashing and checksums |
 | `chrono` | date/time parsing and formatting (6.2.2) |
 | `bytes` (`BytesMut`) | scratch and in-memory buffers |
-| `memmap2` (feature `mmap`, on by default) | memory-mapped reads of the index files and `words.idx` only (Windows, Linux, macOS); compressed blocks use plain file reads (Q93). All `unsafe` is confined to one module; the rest of the crate has `#![deny(unsafe_code)]` |
+| `memmap2` (feature `mmap`, on by default) | memory-mapped reads of the index files and `words.idx` (Windows, Linux, macOS); compressed blocks use plain file reads (Q93). v2 adds the shared, writable maps of the pending buffer (14.3). All `unsafe` is confined to the `filebytes` and `mapped` modules; the rest of the crate has `#![deny(unsafe_code)]` |
 | `fs4` | advisory file locks |
 | `caseless` | full Unicode case folding |
 | `zstd` | block compression |
@@ -454,4 +477,206 @@ The 1 MiB default makes the whole corpus 25.5% of raw with every index (segments
 | single-character word `:` | 35.6 ms (scan) |
 
 Things the benchmarks make visible: a phrase made of very common words (or single characters) falls back to verifying many rows and takes tens of milliseconds, and a single-character word always scans.
+- **Version 2 done (0.2.0, section 14):** `mapped` (counter files, chunked regions), `pending` (epochs, words mirror, mapped writer, recovery, mapped source), `RowEncoder`, `SegmentInput`, views and live readers in `store`, `CommitPolicy` and `commit_if_due`. 124 tests pass with the default features (5 runs in a row) and 102 without `mmap`; clippy is clean both ways. The push benchmark is in 14.16.
 - Next: nothing is planned; remaining work is whatever the user asks for next.
+
+## 14. Version 2: Mapped Pending Buffer and Live Readers
+Status: **implemented in 0.2.0** (breaking, see 14.12). Decisions 101-109 were taken before the implementation, 110-123 during it; where the text below differs from the first plan, it describes what was built.
+
+### 14.1 Goals and non-goals
+- **Pending rows survive a process crash** (panic, `kill -9`, OOM kill) without committing early. Commits then stay at the size that compresses best (6.3, 13), while rows in between are still safe.
+- **Readers in other processes see pending rows.** `open_read_only` stores search, count, page and hydrate rows that are not committed yet, and pick up new rows and new commits by themselves (14.7).
+- **Commit when it pays off:** by rows, by pending bytes, or by the age of the oldest pending row (14.9).
+- Linux, macOS and **Windows**.
+- **Not a goal: surviving power loss or a kernel crash** (Q101). Nothing calls `msync`/`fsync` on the pending buffer: writes to a shared mapping reach the OS page cache right away, which outlives the process, and that is the whole guarantee. Commits stay fully synced as in 7.
+- Not a goal: several writers per folder (one writer stays the rule, 5.4).
+
+### 14.2 Overview
+In v1, the rows since the last commit live in a `DataFrame<MemHeap>` in the writer's RAM. In v2 (Q102) **the pending buffer itself lives in memory-mapped files**: no separate log is written and replayed, because the mapped files *are* the buffer.
+
+The buffered state of each commit interval is called an **epoch**. The manifest names the current epoch `E`, and each epoch has its own files:
+
+| File (prefix `p-<store id>-<E>`) | Contents |
+|---|---|
+| `<prefix>.hdr` | The epoch header: a page of shared atomic counters (14.4) |
+| `<prefix>.words.<nnnn>` | The words added to the heap since the last commit, as `[varint length][bytes]` in ordinal order (the same bytes as `MemHeap`) |
+| `<prefix>.f<id>.ctr` | The counters of frame `id` |
+| `<prefix>.f<id>.cells.<nnnn>` | The frame's cells, **row-major**: per row, `ncols` little-endian `u64` cells, then the null bitmap (`ceil(ncols / 8)` bytes) padded to a multiple of 8 |
+| `<prefix>.f<id>.rheap.<nnnn>` | The frame's row heap: symbol streams and blobs, the same bytes as `Inner::row_heap` |
+
+Every file is append-only while its epoch is current and is never modified after the epoch ends. Commit does not reset anything in place: it starts epoch `E+1` and deletes the files of `E` (14.6). A reader holding `E` mapped keeps a valid view until it moves to `E+1`.
+
+Row-major cells make one row one append. The column-major pivot already happens when the segment writer (`write_segment`) writes the segment at commit.
+
+### 14.3 Regions and chunk files
+A **region** is one logical append-only byte stream (words, cells or row heap of a frame) stored in **chunk files** `<name>.0000`, `<name>.0001`, ...
+- A chunk file is a 4 KiB header followed by its data. The header holds the magic `LSQCHNK1`, the format version, a byte-order mark, and the **logical start offset** of the chunk. A chunk covers the logical bytes `[start_i, start_{i+1})`; the last counted chunk ends at the region's published length.
+- **An entry never crosses a chunk.** When an append does not fit in the current chunk, a new chunk starts at the current logical offset, and the unused tail of the old chunk is not part of the logical stream. So logical offsets are dense, there is no padding, and the stream has exactly the bytes the in-memory buffer would have.
+  - A reader can therefore hand a parser "the rest of the chunk from offset `o`", as `BufferSource::with_entry` does with the whole row heap today.
+  - The cell of row `r` is at `r * stride`.
+- **Chunk sizes grow:** chunk `i` has a capacity of `min(max_chunk, min_chunk << i)` data bytes (defaults 1 MiB and 64 MiB), or more when one entry is larger (rounded up to a whole page). Frames with few rows cost little; busy frames use few files.
+- **Chunk files are never resized or truncated after they are created.** Windows cannot resize a file that another process has mapped (Q105), and on Unix this also rules out `SIGBUS` for readers.
+- **Creation:**
+  1. Create `<name>.<nnnn>.tmp`.
+  2. Reserve space with `fs4::FileExt::allocate`, falling back to `set_len` where the file system does not support it. Reserving the space up front means a full disk fails here with `Error::Io` instead of `SIGBUS` on a later write.
+  3. Write the header and rename the file into place.
+
+  The chunk exists before any of its bytes are published.
+- **Writer:** maps chunks with `memmap2::MmapRaw` (shared, writable).
+  - It writes only beyond the published length, through raw pointers, so it never forms a `&mut [u8]` that overlaps bytes a reader may be reading.
+  - In the same process, readers form `&[u8]` slices only below the published length.
+  - Published bytes are never written again. That makes concurrent reads sound, within the process and across processes.
+- **Reader:** maps the counted chunks read-only (`map_raw_read_only`). It maps more chunks when the published chunk count grows.
+- **Commit reading:** a row-heap block (6.4) may span two chunks; commit then copies that block into a scratch buffer. Block boundaries are the same as in v1, so the segment bytes are the same too.
+
+### 14.4 Counters and the publish protocol
+Counters are `AtomicU64` values in a mapped **counter file**. A counter file is a single page: magic `LSQCTR01`, format version, byte-order mark, then the slots. It is created through a temporary name and a rename, like chunks.
+- **A region has two slots:** `len` (published logical bytes) and `chunks` (published chunk count).
+- **Store-wide slots,** in the epoch header `<prefix>.hdr`: `superseded_by` (0 while current, `E+1` after a commit, `SEALED = u64::MAX` after seal), and the words region (`len`, `chunks`). There is no word count (decision 111): words are length-prefixed and read up to the published length.
+- **Per-frame slots** (`f<id>.ctr`): the cells region (`len`, `chunks`), the row-heap region (`len`, `chunks`), and `first_push_unix_ms` (0 when the frame has no pending row).
+
+**Publishing a row** (the writer, under the write mutex, after every byte of the row is written):
+1. Words: `chunks`, `len`.
+2. Row heap: `chunks`, `len`.
+3. Cells: `chunks`, `len`. This store is **the commit point of the row**.
+
+Each store is a release store. A reader loads the cells `len` first (acquire), then the others (acquire). Because they were stored earlier, the row heap and words it sees are at least as long as the rows need. Within one region, `chunks` is stored before `len` for the same reason.
+
+**Atomic `push_row`:** a failed row publishes nothing.
+- The writer moves its cursors back to the published lengths and deletes any chunk it created for that row. Those chunks were never counted, so no reader has mapped them.
+- The words are rolled back with the existing `WordStore` checkpoint (5.2).
+
+Counters are native-endian (the files are local to one machine); the byte-order mark rejects files from a host with the other byte order.
+
+### 14.5 The writer
+`FrameState::active` becomes `pending: Arc<Pending>`, whose buffer has two variants:
+- `Memory`: v1's `DataFrame<MemHeap>`.
+- `Mapped`: `pending::MappedFrame`.
+
+The validation and tokenizing of a row is the crate-internal `RowEncoder`, shared by `DataFrame` and `MappedFrame`. Each buffer stores the prepared cells itself, with the same whole-string dedup and row-heap block rules (decision 112), so a commit writes the same segment from either. The public in-memory `DataFrame` keeps its API.
+- **Lock order of a push:** write mutex, frame lock (read), the `MappedFrame` writer mutex, then the word store (write), held until the row is published so that a rollback of new words cannot race with a query that just resolved them.
+- **Words:** the writer keeps its `WordStore` in RAM exactly as in v1. The words region is a **mirror** for readers and for recovery: after a row is stored, the words with an ordinal at or above the mirrored count are appended to it. The RAM cost is the pending words only, which is small.
+- **RAM state of the writer:** the dictionary, the whole-string dedup map, the row-heap `block_starts`, and the chunk tables. The rows themselves are in the page cache, not on the heap.
+- **Pending size:** `Frame::pending_bytes()` is the published cells length plus the row-heap length (a memory buffer: rows × columns × 8 plus its row heap). `Store::pending_bytes()` adds the bytes of the words added to the word store since the last commit.
+
+### 14.6 Commit, seal and epochs
+`commit()` (under the write mutex):
+1. Append the new words to `heap.bin` and write one segment per frame with pending rows, plus their indexes, exactly as in v1. These are read from the mapped regions.
+2. Create the empty epoch `E+1`: the header and the counter files of every frame. The data chunks are created on first use.
+3. Write the manifest with `epoch = E+1`. This is the commit point, as in v1.
+4. Store `superseded_by = E+1` in the header of `E` (release).
+5. Switch the in-memory state, as in v1 (new `SegmentReader`s, `committed_rows`), plus the new `Pending` buffer.
+6. Delete the files of `E`, and of any older epoch still present. On Windows a file that a reader still maps cannot be deleted; it is left in place and deletion is retried at the next commit and at the next writable open (Q105).
+
+**`seal()`:** commit, write `words.idx` as in v1, store `superseded_by = SEALED`, then delete the pending files. A sealed manifest names no epoch.
+
+**`create_frame`** writes the manifest at once (a commit with no rows). Readers then always know the schema of every frame that may have pending rows, and frame ids in file names are stable.
+
+### 14.7 Live readers
+`open_read_only` maps the epoch named by the manifest, if it has one and its files exist.
+
+Each query works on a **view**, taken at its start: the segment list, the pending buffer and its published row count, all held through `Arc`s. A query never sees half an epoch switch. Rows move from the buffer into a segment under the same global row numbers, so a row number stays valid across a switch.
+
+**Auto refresh** (Q104). At the start of `search`, `count`, `search_page`, `row`, `value`, `write_string`, `len` and `rows`, the store refreshes:
+1. Load `superseded_by` of its epoch.
+   - If it is not 0: re-read the manifest, open the new segments and their indexes, map the new epoch, and drop the old one.
+   - If it is `SEALED`: re-read the manifest, map the `words.idx` written at seal, and end the pending buffer.
+2. Load the counters, then map any new chunks.
+3. Add the words published since the last refresh to the reader's `WordStore`: the heap and the dictionary (read-only stores have no dictionary limit, 7). The ordinals are the ones the writer assigned, so they match.
+
+When nothing changed, this costs a few atomic loads.
+
+**Search over pending rows:**
+- A `MappedSource: RowSource` serves the pending rows: `cell` reads the row-major cells, `with_entry` hands out the tail of the chunk, and `range` scans.
+- An in-memory index of the pending rows is built lazily per reader and rebuilt when the row count has grown, like `active_index` in v1. Building it incrementally is future work.
+- The same source serves the writer's own process, so there is one read path. Mapped reads take no buffer lock, which removes the lock-order rule of `BufferSource` (query.rs) for this path.
+
+**Writer gone:** a reader keeps the last published state of the epoch. Those rows are valid, because they were published, and they stay visible until a writer commits them.
+
+### 14.8 Recovery
+A writable `Store::open` with a mapped buffer:
+1. Read the manifest. If the header of the epoch it names (`E`) is missing, start an empty `E`. With a tmpfs `pending_dir`, this is what happens after a reboot. `Store::recovery()` reports it (`RecoveryReport { pending_rows, pending_files_missing }`).
+2. Map the regions. Delete chunk files beyond each region's published chunk count and any `.tmp` files (an interrupted row). The cursors start at the published lengths.
+3. **Rebuild the RAM state:**
+   - Load the words from `heap.bin` (committed) plus the words region. This restores the heap, the dictionary and the ordinals exactly.
+   - Collect the distinct row-heap offsets of all string and blob cells, in ascending order. Entries are appended back to back and every published entry belongs to a published row, so these offsets are exactly the entry starts, and entry `i` ends where entry `i+1` starts.
+   - From that list, rebuild `block_starts` with the push rule, and the dedup map by hashing each entry (up to the cap, 6.4).
+4. Finish an interrupted commit: any older epoch of this store id still present in `pending_dir` (the crash came after the manifest rename) gets `superseded_by` set, so its readers move on, and its files are deleted (retried later on Windows).
+5. Continue appending to `E`. There is no recovery commit, so a restart does not create a small segment.
+6. Opening with `PendingMode::Memory`, or with a different `pending_dir`, while `E` has pending rows commits them first (one small segment), then switches.
+
+**Crash matrix:**
+| Crash during | State after reopen |
+|---|---|
+| `push_row`, before the cells `len` store | The row is absent. Uncounted chunks and `.tmp` files are deleted. Bytes past the published lengths are ignored and overwritten later. |
+| `push_row`, after the cells `len` store | The row is present. |
+| commit, before the manifest rename | As before the commit: the epoch `E` buffer is intact, and the stray segments are removed (7). |
+| commit, after the manifest rename | The rows are in the segment. The `E` files are deleted at open, and readers switch at their next query. |
+
+### 14.9 Commit policy
+`StoreOptions::commit_policy: CommitPolicy { max_bytes, max_age }` (Q103; the row limit is `StoreOptions::segment_rows`, decision 110):
+- Defaults: 256 MiB and no age limit; `segment_rows` stays 100,000.
+- `Store::commit_if_due()` commits when any frame reaches `segment_rows`, the pending bytes (14.5) of the store reach `max_bytes`, or the oldest pending row (`first_push_unix_ms`, kept across restarts) is older than `max_age`. It returns which trigger fired.
+- The caller calls it in its write loop, as today. A long-idle store does not commit by itself; a caller that wants age-based commits calls it from a timer too.
+- `commit_if_full()` stays, as rows only.
+- The byte limit bounds the page cache or tmpfs used by the buffer, and the commit time.
+
+### 14.10 Options
+- `StoreOptions::pending: PendingMode`. The default is `Mapped`; `Memory` is v1's behaviour, and the only mode without the `mmap` feature (Q106). Readers see pending rows only from a `Mapped` writer.
+- `StoreOptions::pending_dir: Option<PathBuf>`. The default `None` is the store folder; for example `/dev/shm` avoids disk writeback, but pending rows are then lost on reboot (Q107).
+  - The manifest records the directory (absolute) and a random 128-bit **store id**. Readers find the files without being told, and several stores can share one directory.
+  - Files of deleted stores are not cleaned up in a shared directory; the caller owns that directory.
+- `StoreOptions::pending_chunk_min_bytes` and `pending_chunk_max_bytes`, default 1 MiB and 64 MiB.
+- `StoreOptions::commit_policy` (14.9).
+
+### 14.11 Formats and compatibility
+- Manifest `FORMAT_VERSION` 2 adds `epoch: u64`, `store_id: u128` and `pending: { mode, dir }`.
+- v2 code reads v1 manifests (epoch 0, no pending buffer) and writes v2 at the first commit. v1 code rejects a v2 manifest (`UnsupportedVersion`).
+- Segments, indexes, `heap.bin` and `words.idx` do not change.
+
+### 14.12 API changes (0.2.0)
+- **New:**
+  - `PendingMode`, `CommitPolicy`, `CommitTrigger`, `RecoveryReport`.
+  - `Store::commit_if_due`, `Store::recovery`, `Store::pending_bytes`, `Frame::pending_bytes`.
+  - `Store::max_open_segments` is kept.
+- **Breaking:** the new public fields of `StoreOptions` break struct literals that list every field (see decision 100), hence 0.2.0.
+- **Changed meaning:**
+  - `Frame::len` on a read-only store now includes pending rows (after an auto refresh).
+  - AGENTS.md rules 2 and 3 change: uncommitted rows survive a process crash in `Mapped` mode.
+
+### 14.13 Code layout
+- `mapped` (new; with `filebytes`, one of the two modules allowed to use `unsafe`): `CounterFile`, `Region` (writer and reader roles), chunk files.
+- `pending` (new): `Epoch` (header, words mirror, file naming, deletion with retry), `MappedFrame` (writer and recovery) and `MappedSource` (`RowSource` and `SegmentInput`). Without the `mmap` feature, `pending_stub.rs` takes its place with uninhabited types, so `store` has no `cfg` branches.
+- `dataframe`: `RowEncoder`, the row preparation shared by both buffers.
+- `store`: epochs, the view and auto refresh, commit from either buffer, recovery, and the options.
+- `segment`: the writer reads cells and row-heap blocks through the `SegmentInput` trait instead of `&Inner`.
+- `query`: `BufferSource` takes a row limit, so a view of a memory buffer is a snapshot too.
+
+### 14.14 Tests
+- **`mapped`:** append and read; chunk growth; oversize entries; rollback across a new chunk; reopen at the published length; a reader sees only published bytes and picks up new chunks; **cross-process**: a child process writes while the parent reads, and a child that aborts in the middle of a row.
+- **Recovery exactness** (`store::tests::mapped_and_memory_buffers_write_identical_segments_even_after_recovery`): the same rows (repeated strings, long strings across chunks, blobs, nulls) committed from a memory buffer, from a mapped buffer, and from a mapped buffer after five writer restarts without a commit give byte-identical heap, segment and index files. This checks the rebuilt dedup map and `block_starts` more strictly than a filter comparison would.
+- **`store`:**
+  - The 27 ground-truth queries on the writer and on a following reader, in every state (pending only, segment, segment plus pending, sealed), in both modes.
+  - A reader process searching while a writer process pushes, commits and seals; a writer process killed mid-way (every pushed row is recovered, and a reader sees them while no writer runs).
+  - An epoch switch during a running search; a dataframe created after the reader opened.
+  - Commit triggers (rows, bytes, age across a restart); a failed row in mapped mode; a format 1 manifest upgraded; switching modes; a separate and then lost pending directory; deletion of old epoch files.
+  - The rest of the suite runs in the default `Mapped` mode; `cargo test --no-default-features` runs it in `Memory` mode.
+- **Windows:** deferred deletion is exercised by the cleanup tests (a file that cannot be deleted is retried later); on Windows they run when `cargo test` is run there by hand. The project has no CI (local only, see AGENTS.md).
+
+### 14.15 Implementation steps
+All done in 0.2.0.
+1. `mapped`: counter files, regions and chunk files, with the publish protocol and cross-process tests.
+2. `RowEncoder` in `dataframe`, and the mapped writer and recovery in `pending`.
+3. The words mirror and the rebuild of the dictionary, dedup and `block_starts`.
+4. `MappedSource`, the view, auto refresh and the epoch switch in `store`; the segment writer over a source.
+5. `CommitPolicy` and `commit_if_due`.
+6. Windows deferred deletion (no CI: the project is built and tested locally only).
+7. Docs: sections 5.4, 6.3, 7 and 10 here, AGENTS.md, README and CHANGELOG; the 0.2.0 release.
+
+### 14.16 Risks and open points
+- **Reader index rebuilds:** a reader that queries a fast-growing buffer rebuilds the pending index often (up to `max_rows` rows each time). If this shows up in profiles, make the index incremental.
+- **Sparse fallback:** where `allocate` is not supported, chunks are sparse, and a full disk can raise `SIGBUS` on a write to the mapping. This is documented; tmpfs and the common Linux, macOS and Windows file systems support allocation.
+- **Disk writeback:** with the default in-folder `pending_dir`, the kernel writes dirty pages to disk about every 30 s. That is extra I/O but no extra syscalls on the write path.
+- **Push cost (measured):** `push_row` into a store costs 4.0 µs per row with the mapped buffer and 3.2 µs with the memory buffer (criterion, 1,000 synthetic rows, chunk creation included). Insert throughput is not a goal (1).
+- **Readers of a `Memory` writer** do not follow it: there is no cheap signal of a new commit without the epoch header (decision 116). They reopen to see new commits, as in v1.
+- **Writer lock and child processes:** a process that drops a writable store and reopens it while another thread spawns a child process can see `Error::Locked` for a moment: the child holds a copy of the lock file until it executes. The tests avoid it with a test-only guard (decision 122).

@@ -40,7 +40,12 @@ This is a library. A server or web app calls it; neither is part of this crate.
   dictionary (64 MiB limit; start a new folder when full). Sealing the folder at rotation drops the dictionary; it can
   be rebuilt from the heap.
 - **Crash-safe commits.** Heap blocks, then segments, then the manifest, which is replaced by an atomic rename. A crash
-  loses at most the uncommitted rows.
+  during a commit leaves the previous commit intact.
+- **Pending rows in memory-mapped files** (`PendingMode::Mapped`, the default). Rows pushed since the last commit live in
+  append-only mapped files, so they survive a crash or kill of the writer process without committing early (commits
+  stay at the size that compresses best), and the next writer continues with them. A power loss or kernel crash can
+  still lose them: nothing calls `msync` on the pending files. `pending_dir` can put them on a tmpfs such as `/dev/shm`.
+  `PendingMode::Memory` keeps the 0.1 behaviour (pending rows in RAM, lost on exit).
 - **Search.** Word, case-insensitive word (full Unicode case folding), phrase, equality and range filters, AND-combined.
   `search` (lazy row ids), `count`, and `search_page` (sort by a fixed-size column, offset, limit).
 - **Persisted, optional indexes.** Word, case-folded word and equality indexes with delta-varint postings, compressed or
@@ -50,15 +55,20 @@ This is a library. A server or web app calls it; neither is part of this crate.
 - **Hydration.** `row`, `value`, `rows()` iterator, and `write_string` into a reusable `BytesMut` for few allocations.
 - **Many readers, one writer.** One writer per folder (a lock file, plus a mutex serializing `push_row`, `commit` and
   `create_frame`). Readers take no lock.
+- **Live readers.** A read-only store in another process sees and searches the writer's pending rows, and follows its
+  commits by itself: every read and query first checks a few shared counters. Row numbers stay the same when rows move
+  from the pending buffer into a segment, and a running search keeps the snapshot it started with.
+- **Commit policy.** `commit_if_due` commits when a dataframe reaches `segment_rows` pending rows, when the pending rows
+  take `commit_policy.max_bytes`, or when the oldest one is `commit_policy.max_age` old.
 - **Integrity.** `Store::verify` checks every checksum; corrupt data returns `Error::Corrupt`, never a panic.
-- **Safe Rust.** `#![deny(unsafe_code)]`, with a single `unsafe` block in `filebytes.rs` for memory mapping (feature
-  `mmap`).
+- **Safe Rust.** `#![deny(unsafe_code)]`; `unsafe` is confined to memory mapping in `filebytes.rs` and `mapped.rs`
+  (feature `mmap`), with the rules that make it sound written at the top of `mapped.rs`.
 
 ## Quick start
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-logsquash = "0.1"
+adaptif-gatotkaca-logsquash = "0.2"
 ```
 
 ```rust
@@ -83,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Value::Str(if i % 10 == 0 { "ERROR" } else { "INFO" }),
             Value::Str(&message),
         ])?;
-        store.commit_if_full()?; // commits when the buffer reaches `segment_rows`
+        store.commit_if_due()?; // commits at `segment_rows` rows, `commit_policy.max_bytes` or `commit_policy.max_age`
     }
     store.commit()?;
     store.seal()?; // end of the period: dictionary dropped, indexes finished
@@ -119,7 +129,7 @@ The 1,000 rows above take about 25 KB on disk.
 | **Dictionary** | In-memory map from a word to its ordinal, used by the writer. Limited to 64 MiB; rebuilt from the heap. |
 | **Row** | A global number (0-based, across all segments of a frame, including uncommitted rows). |
 
-Typical lifecycle of a folder: `create` → `create_frame` → many `push_row` and `commit_if_full` → `commit` → `seal`
+Typical lifecycle of a folder: `create` → `create_frame` → many `push_row` and `commit_if_due` → `commit` → `seal`
 at rotation. After that, open it read-only for as long as you keep the logs.
 
 ## Schemas and columns
@@ -190,7 +200,7 @@ let options = StoreOptions {
 | Option | Default | Meaning |
 |---|---|---|
 | `zstd_level` | 19 | Level of every block. 22 gains nothing measurable. |
-| `segment_rows` | 100,000 | Rows at which `commit_if_full` commits. |
+| `segment_rows` | 100,000 | Rows at which `commit_if_full` and `commit_if_due` commit. |
 | `block_rows` | 4,096 | Rows per column block. |
 | `row_heap_block_bytes` | 1 MiB | Larger blocks are smaller on disk and slower for a random row. |
 | `heap_block_bytes` | 1 MiB | Size of a heap block. |
@@ -200,6 +210,11 @@ let options = StoreOptions {
 | `indexing` | true | Write index files on commit. |
 | `compress_indexes` | true | zstd-compress index files; off means memory-mapped. |
 | `tokenizer` | see docs | Thresholds of inline-run detection. |
+| `pending` | `Mapped` | Where pending rows live: mapped files (survive a process crash, visible to readers) or `Memory`. |
+| `pending_dir` | the store folder | Directory of the mapped pending files, for example `/dev/shm` (lost on reboot). |
+| `pending_chunk_min_bytes` | 1 MiB | First chunk file of each mapped region; later chunks double. |
+| `pending_chunk_max_bytes` | 64 MiB | Largest chunk file (single larger entries get their own). |
+| `commit_policy` | 256 MiB, no age | `max_bytes` and `max_age` for `commit_if_due`. |
 
 A store keeps at most 64 segment files open (least recently used first out; a closed file is reopened on its next
 read). Change it on an open store with `store.set_max_open_segments(n)`; `store.open_segment_files()` reports how many
@@ -210,7 +225,7 @@ builds `StoreOptions` with every field listed.
 
 | Feature | Default | Effect |
 |---|---|---|
-| `mmap` | on | Memory-map uncompressed index files (`memmap2`). Without it they are read into memory. |
+| `mmap` | on | Memory-map uncompressed index files and the pending buffer (`memmap2`). Without it index files are read into memory and pending rows stay in memory (`PendingMode::Memory`). |
 | `json` | off | Optional `serde` and `serde_json` dependencies, reserved for JSON helpers; no effect on the API yet. |
 
 ## Benchmarks
@@ -272,7 +287,12 @@ entropy thresholds) are in [DESIGN.md](DESIGN.md), section 13. Reproduce with
   that commits often does not run out of file descriptors. Segment files must stay in place while a store uses them:
   a reader whose file was closed and then deleted or replaced gets `Error::Io` on its next read.
 - The format is versioned; a folder written with another format or splitter version fails with
-  `Error::UnsupportedVersion`.
+  `Error::UnsupportedVersion`. 0.2 reads 0.1 folders and upgrades them at the first writable open; 0.1 cannot read
+  a folder written by 0.2.
+- Pending rows (`PendingMode::Mapped`) survive a crash of the writer process, not a power loss or kernel crash. A read-only
+  store follows a writer only in that mode; with `PendingMode::Memory` it sees what was committed when it was opened.
+- Opening a store with another `pending` mode or `pending_dir` than it was written with commits its pending rows (one
+  small segment) and switches.
 - Text types are validated: out-of-range numbers, bad dates and over-precise times are errors.
 
 ## MSRV

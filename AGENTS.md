@@ -9,10 +9,13 @@ see the whole flow.
 
 - A **Store** is a folder for one day or period. It holds one or more **Frames** (tables with a fixed schema) that
   share one word heap, which is what makes it small.
-- You **write** with one writer per folder: `push_row` into the frame, then `commit` (or `commit_if_full`). At rotation
+- You **write** with one writer per folder: `push_row` into the frame, then `commit` (or `commit_if_due`). At rotation
   call `seal`. A sealed folder is immutable and is opened with `open_read_only`.
-- You **read** with any number of `open_read_only` stores at once, no lock. Reading works on a store that is still
-  being written too, but only sees committed rows (plus, in the writer's own process, the pending ones).
+- Rows pushed since the last commit are **pending**. By default (`PendingMode::Mapped`) they live in memory-mapped files:
+  they survive a crash or kill of the writer process (not a power loss), and the next `Store::open` continues with them.
+- You **read** with any number of `open_read_only` stores at once, no lock. A read-only store of a folder that is still
+  being written **follows the writer**: every read and query sees its pending rows and picks up its commits by itself
+  (with `PendingMode::Mapped`; with `PendingMode::Memory` a reader sees only what was committed when it opened).
 - Rows are numbered globally per frame, from 0. `search` gives row numbers; `row(n)` gives the values.
 
 ## 2. Golden rules
@@ -21,10 +24,14 @@ see the whole flow.
    `Arc<Store>`/`Arc<Frame>` between threads instead; `push_row` and `commit` are serialized for you, and searches and
    reads may run on other threads at the same time (use 0.1.1 or later: 0.1.0 could deadlock a search of uncommitted
    rows against a concurrent `push_row`).
-2. **Always `commit` before you stop, and `seal` at the end of the period.** Rows that are not committed are lost on
+2. **`seal` at the end of the period, and `commit` before you stop when you can.** With the default
+   `PendingMode::Mapped`, pending rows survive a process crash and are recovered by the next `Store::open`
+   (`store.recovery()` tells how many), but not a power loss or kernel crash; with `PendingMode::Memory` they are lost on
    exit. `seal` finishes the indexes and the word table and closes the store for writing.
-3. **Call `commit_if_full()` regularly while writing** (for example every 1,000 rows). It commits at `segment_rows`
-   (100,000). Never commit after every row: each commit writes a segment and tiny segments compress badly.
+3. **Call `commit_if_due()` regularly while writing** (for example every 1,000 rows, and from a timer if you set
+   `commit_policy.max_age`). It commits at `segment_rows` (100,000) rows in a frame, at `commit_policy.max_bytes`
+   (256 MiB) of pending rows, or when the oldest pending row is `max_age` old. Never commit after every row: each commit
+   writes a segment and tiny segments compress badly; the mapped pending buffer is what keeps rows safe in between.
 4. **Flag the columns you will search, at schema time.** `index_words()` for word/phrase, `case_insensitive()` for
    `word_ci`, `index_equality()` for `equals`. Without a flag the search still works but scans the column.
 5. **Put separate log sources into separate columns**, one wide frame is fine; nulls cost almost nothing. Use real types
@@ -58,14 +65,16 @@ for (ts, level, line) in incoming {
         Err(Error::DictionaryFull | Error::HeapFull) => { /* seal, open the next folder, retry the row */ }
         Err(e) => return Err(e.into()),
     }
-    store.commit_if_full()?;
+    store.commit_if_due()?;
 }
 store.commit()?;
 store.seal()?; // at midnight
 ```
 
-To reopen a folder for more writing (same day, after a restart): `Store::open(path, options)`, then
-`store.frame("logs")`. The dictionary is rebuilt from the heap.
+To reopen a folder for more writing (same day, after a restart or a crash): `Store::open(path, options)`, then
+`store.frame("logs")`. The dictionary is rebuilt from the heap, and pending rows left by the previous process are
+recovered (`store.recovery().pending_rows`). Open with the same `pending` mode and `pending_dir`: different ones
+commit the pending rows and switch.
 
 ### Serve a viewer (read-only)
 
@@ -83,6 +92,9 @@ for n in &page.rows { let row = logs.row(*n)?; /* render */ }
 ```
 
 - Calls are blocking and CPU/IO bound: from an async server run them in `spawn_blocking`.
+- Live view while the writer runs: keep the read-only store open. Each `search`, `count`, `search_page`, `row` and `len`
+  sees the writer's latest pending rows and commits; a running search and a page keep the snapshot they started with,
+  and row numbers never change. Call `store.frame(name)` again to find dataframes created after you opened the store.
 - `Frame::row` costs about 1 ms cold (one 1 MiB row-heap block decompress), much less when the block is cached.
   Fetch only the rows of the page you show.
 - `Frame::count(&q)` is cheaper than iterating `search`.
@@ -118,6 +130,9 @@ folder size.
 | Fast ingest | `indexing: false`, `zstd_level: 3..9` (larger files), build indexes afterwards |
 | Less memory per reader | lower `cache_bytes` (32 MiB per segment by default) |
 | Index files read with mmap | `compress_indexes: false` (bigger index files, no decompress on open) |
+| Pending rows off the disk | `pending_dir: Some("/dev/shm/logs".into())` (no disk writeback; pending rows lost on reboot) |
+| 0.1 behaviour, fastest push | `pending: PendingMode::Memory` (pending rows lost on exit; readers see commits only) |
+| Commit by age or size | `commit_policy: CommitPolicy { max_bytes, max_age: Some(Duration::from_secs(600)) }` |
 
 Leave `block_rows`, `segment_rows`, `zstd_level 19` and the tokenizer thresholds alone: sweeps on 775 MB of real logs
 showed no useful gain. Details: DESIGN.md section 13.
@@ -158,5 +173,11 @@ showed no useful gain. Details: DESIGN.md section 13.
 ## 8. Testing code that uses the crate
 
 Use `tempfile::tempdir()` for the folder, `StoreOptions { zstd_level: 3, ..Default::default() }` to be fast, and compare a
-search result against a plain filter over the rows you inserted. The crate's own tests do the same: 97 tests including
-`proptest` round trips.
+search result against a plain filter over the rows you inserted. The crate's own tests do the same, including
+`proptest` round trips, a reader process following a writer process, and a writer process killed mid-way.
+
+**Local only, no CI.** This project is built and tested locally only. Do not add CI configuration (no `.github/workflows`,
+no CI jobs) and do not plan any. Before a change is done, run locally: `cargo fmt`, `cargo clippy --all-targets`,
+`cargo clippy --no-default-features --all-targets`, `cargo test` and `cargo test --no-default-features`.
+Platform-specific behaviour (for example Windows file deletion) is covered by tests that run when someone runs
+`cargo test` on that platform by hand.

@@ -3,8 +3,8 @@
 //! examples (`tune_corpus`, `search_corpus`).
 
 use adaptif_gatotkaca_logsquash::{
-    Column, ColumnType, DataFrame, DefaultSplitter, Dictionary, MemHeap, OrderBy, Page, Query, Schema, Store, StoreOptions, Tokenizer,
-    TokenizerOptions, Value, WordStore,
+    Column, ColumnType, DataFrame, DefaultSplitter, Dictionary, MemHeap, OrderBy, Page, PendingMode, Query, Schema, Store, StoreOptions,
+    Tokenizer, TokenizerOptions, Value, WordStore,
 };
 use bytes::BytesMut;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
@@ -135,6 +135,28 @@ fn inserting(c: &mut Criterion) {
             BatchSize::LargeInput,
         )
     });
+    for (name, pending) in [
+        ("push_row x1000 into a store (mapped pending buffer)", PendingMode::Mapped),
+        ("push_row x1000 into a store (memory pending buffer)", PendingMode::Memory),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || {
+                    let dir = tempfile::tempdir().unwrap();
+                    let store = Store::create(dir.path(), StoreOptions { pending, ..options() }).unwrap();
+                    let frame = store.create_frame("logs", schema()).unwrap();
+                    (dir, store, frame)
+                },
+                |(dir, store, frame)| {
+                    for (level, msg, data, id, ts) in &rows {
+                        frame.push_row(&[Value::I64(*id), Value::Str(ts), Value::Str(level), Value::Str(msg), Value::Str(data)]).unwrap();
+                    }
+                    (dir, store, frame)
+                },
+                BatchSize::PerIteration,
+            )
+        });
+    }
     group.finish();
 }
 

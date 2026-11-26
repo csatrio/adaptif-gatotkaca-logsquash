@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Value::Str(if i % 10 == 0 { "ERROR" } else { "INFO" }),
             Value::Str(&message),
         ])?;
-        store.commit_if_full()?; // commits when the buffer reaches `segment_rows`
+        store.commit_if_due()?; // commits at `segment_rows` rows, `commit_policy.max_bytes` or `commit_policy.max_age`
     }
     store.commit()?;
     store.seal()?; // end of the period: the dictionary is dropped, indexes are finished

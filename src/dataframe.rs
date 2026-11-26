@@ -75,7 +75,7 @@ pub(crate) struct Inner {
 }
 
 /// A cell prepared for insertion.
-enum Prepared {
+pub(crate) enum Prepared {
     Cell(Option<u64>),
     Null,
     /// A range of the scratch buffer to store in the row heap.
@@ -86,95 +86,55 @@ enum Prepared {
     },
 }
 
-/// A table of typed columns sharing a word store with other dataframes.
-pub struct DataFrame<H: Heap = MemHeap> {
+/// Turns the values of a row into cells and row-heap entries. Shared by the in-memory buffer ([`DataFrame`]) and the
+/// mapped pending buffer of a store (DESIGN.md 14.5).
+pub(crate) struct RowEncoder<H: Heap = MemHeap> {
     schema: Arc<Schema>,
     tokenizer: Tokenizer<H>,
-    dedup_entries: usize,
-    block_bytes: u64,
-    inner: RwLock<Inner>,
 }
 
-impl<H: Heap> DataFrame<H> {
-    /// An empty dataframe with default options.
-    pub fn new(schema: Schema, words: SharedWords<H>) -> Self {
-        Self::with_options(schema, words, DataFrameOptions::default())
+impl<H: Heap> RowEncoder<H> {
+    pub(crate) fn new(schema: Arc<Schema>, words: SharedWords<H>, options: TokenizerOptions) -> Self {
+        Self { schema, tokenizer: Tokenizer::new(words, options) }
     }
 
-    /// An empty dataframe.
-    pub fn with_options(schema: Schema, words: SharedWords<H>, options: DataFrameOptions) -> Self {
-        let columns = (0..schema.len()).map(|_| ColumnData::default()).collect();
-        Self {
-            schema: Arc::new(schema),
-            tokenizer: Tokenizer::new(words, options.tokenizer),
-            dedup_entries: options.dedup_entries,
-            block_bytes: options.row_heap_block_bytes.max(1) as u64,
-            inner: RwLock::new(Inner { columns, ..Inner::default() }),
-        }
+    /// The shared word store.
+    pub(crate) fn words(&self) -> &SharedWords<H> {
+        self.tokenizer.words()
     }
 
     /// The schema.
-    pub fn schema(&self) -> &Schema {
+    #[cfg_attr(not(feature = "mmap"), allow(dead_code))]
+    pub(crate) fn schema(&self) -> &Schema {
         &self.schema
     }
 
-    /// Number of rows.
-    pub fn len(&self) -> u64 {
-        self.inner.read().expect("dataframe lock poisoned").rows
-    }
-
-    /// Whether there are no rows.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Appends a row and returns its row number. On any error nothing is added (not even new words).
-    pub fn push_row(&self, row: &[Value<'_>]) -> Result<u64> {
+    /// Prepares every cell of `row` into `out`, with the entries of strings and blobs back to back in `entries`. The
+    /// caller holds the word store for writing; on an error the words added by this row are rolled back.
+    pub(crate) fn prepare_row(
+        &self,
+        words: &mut WordStore<H>,
+        row: &[Value<'_>],
+        entries: &mut BytesMut,
+        out: &mut Vec<Prepared>,
+    ) -> Result<()> {
         let columns = self.schema.columns();
         if row.len() != columns.len() {
             return Err(Error::ColumnCount { expected: columns.len(), got: row.len() });
         }
-        let mut guard = self.inner.write().expect("dataframe lock poisoned");
-        let Inner { columns: data, rows, row_heap, block_starts, dedup, scratch } = &mut *guard;
-        let mut entries = std::mem::take(scratch);
         entries.clear();
-
-        let mut words = self.tokenizer.words().write().expect("word store lock poisoned");
+        out.clear();
         let checkpoint = words.checkpoint();
-        let mut prepared = Vec::with_capacity(columns.len());
         for (column, value) in columns.iter().zip(row) {
-            match self.prepare(&mut words, &mut entries, column, value) {
-                Ok(p) => prepared.push(p),
+            match self.prepare(words, entries, column, value) {
+                Ok(p) => out.push(p),
                 Err(e) => {
                     words.rollback(checkpoint);
-                    *scratch = entries;
                     return Err(e);
                 }
             }
         }
-        drop(words);
-
-        for (column, p) in data.iter_mut().zip(prepared) {
-            match p {
-                Prepared::Cell(Some(cell)) => {
-                    column.cells.push(cell);
-                    column.nulls.push(false);
-                }
-                Prepared::Cell(None) | Prepared::Null => {
-                    column.cells.push(0);
-                    column.nulls.push(true);
-                }
-                Prepared::Entry { start, end, dedup: remember } => {
-                    let cap = (self.dedup_entries, self.block_bytes);
-                    let offset = store_entry(row_heap, block_starts, dedup, cap, &entries[start..end], remember);
-                    column.cells.push(offset + 1);
-                    column.nulls.push(false);
-                }
-            }
-        }
-        *rows += 1;
-        *scratch = entries;
-        Ok(*rows - 1)
+        Ok(())
     }
 
     fn prepare(&self, words: &mut WordStore<H>, entries: &mut BytesMut, column: &Column, value: &Value<'_>) -> Result<Prepared> {
@@ -202,25 +162,105 @@ impl<H: Heap> DataFrame<H> {
             _ => Err(Error::TypeMismatch { column: column.name.clone() }),
         }
     }
+}
+
+/// A table of typed columns sharing a word store with other dataframes.
+pub struct DataFrame<H: Heap = MemHeap> {
+    schema: Arc<Schema>,
+    encoder: RowEncoder<H>,
+    dedup_entries: usize,
+    block_bytes: u64,
+    inner: RwLock<Inner>,
+}
+
+impl<H: Heap> DataFrame<H> {
+    /// An empty dataframe with default options.
+    pub fn new(schema: Schema, words: SharedWords<H>) -> Self {
+        Self::with_options(schema, words, DataFrameOptions::default())
+    }
+
+    /// An empty dataframe.
+    pub fn with_options(schema: Schema, words: SharedWords<H>, options: DataFrameOptions) -> Self {
+        let columns = (0..schema.len()).map(|_| ColumnData::default()).collect();
+        let schema = Arc::new(schema);
+        Self {
+            encoder: RowEncoder::new(schema.clone(), words, options.tokenizer),
+            schema,
+            dedup_entries: options.dedup_entries,
+            block_bytes: options.row_heap_block_bytes.max(1) as u64,
+            inner: RwLock::new(Inner { columns, ..Inner::default() }),
+        }
+    }
+
+    /// The schema.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// Number of rows.
+    pub fn len(&self) -> u64 {
+        self.inner.read().expect("dataframe lock poisoned").rows
+    }
+
+    /// Whether there are no rows.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Appends a row and returns its row number. On any error nothing is added (not even new words).
+    pub fn push_row(&self, row: &[Value<'_>]) -> Result<u64> {
+        let mut guard = self.inner.write().expect("dataframe lock poisoned");
+        let Inner { columns: data, rows, row_heap, block_starts, dedup, scratch } = &mut *guard;
+        let mut entries = std::mem::take(scratch);
+        let mut prepared = Vec::with_capacity(self.schema.len());
+        let mut words = self.encoder.words().write().expect("word store lock poisoned");
+        if let Err(e) = self.encoder.prepare_row(&mut words, row, &mut entries, &mut prepared) {
+            *scratch = entries;
+            return Err(e);
+        }
+        drop(words);
+
+        for (column, p) in data.iter_mut().zip(prepared) {
+            match p {
+                Prepared::Cell(Some(cell)) => {
+                    column.cells.push(cell);
+                    column.nulls.push(false);
+                }
+                Prepared::Cell(None) | Prepared::Null => {
+                    column.cells.push(0);
+                    column.nulls.push(true);
+                }
+                Prepared::Entry { start, end, dedup: remember } => {
+                    let cap = (self.dedup_entries, self.block_bytes);
+                    let offset = store_entry(row_heap, block_starts, dedup, cap, &entries[start..end], remember);
+                    column.cells.push(offset + 1);
+                    column.nulls.push(false);
+                }
+            }
+        }
+        *rows += 1;
+        *scratch = entries;
+        Ok(*rows - 1)
+    }
 
     /// Reads one row.
     pub fn row(&self, row: u64) -> Result<Vec<OwnedValue>> {
         let inner = self.inner.read().expect("dataframe lock poisoned");
-        let words = self.tokenizer.words().read().expect("word store lock poisoned");
+        let words = self.encoder.words().read().expect("word store lock poisoned");
         (0..self.schema.len()).map(|column| self.value_at(&inner, &words, row, column)).collect()
     }
 
     /// Reads one value.
     pub fn value(&self, row: u64, column: usize) -> Result<OwnedValue> {
         let inner = self.inner.read().expect("dataframe lock poisoned");
-        let words = self.tokenizer.words().read().expect("word store lock poisoned");
+        let words = self.encoder.words().read().expect("word store lock poisoned");
         self.value_at(&inner, &words, row, column)
     }
 
     /// Writes the text of a string cell into `out` without allocating a `String`. Returns `false` for null.
     pub fn write_string(&self, row: u64, column: usize, out: &mut BytesMut) -> Result<bool> {
         let inner = self.inner.read().expect("dataframe lock poisoned");
-        let words: std::sync::RwLockReadGuard<'_, WordStore<H>> = self.tokenizer.words().read().expect("word store lock poisoned");
+        let words: std::sync::RwLockReadGuard<'_, WordStore<H>> = self.encoder.words().read().expect("word store lock poisoned");
         let col = self.check(&inner, row, column)?;
         if col.ty != ColumnType::String {
             return Err(Error::TypeMismatch { column: col.name.clone() });
@@ -254,26 +294,10 @@ impl<H: Heap> DataFrame<H> {
         self.inner.read().expect("dataframe lock poisoned").dedup.len()
     }
 
-    /// The cell of a row and whether it is null (for query evaluation over the buffer).
-    pub(crate) fn source_cell(&self, row: u64, column: usize) -> Result<(u64, bool)> {
-        let inner = self.inner.read().expect("dataframe lock poisoned");
-        self.check(&inner, row, column)?;
-        let data = &inner.columns[column];
-        Ok((data.cells[row as usize], data.nulls.get(row as usize)))
-    }
-
     /// Runs `f` on the buffered rows under the buffer lock (writing a segment, a query or an index over the buffer). Take
     /// it before the word store: see `query::BufferSource`.
     pub(crate) fn with_inner<R>(&self, f: impl FnOnce(&Inner) -> R) -> R {
         f(&self.inner.read().expect("dataframe lock poisoned"))
-    }
-
-    /// Drops all rows (after they were written to a segment). Keeps the allocations.
-    pub(crate) fn clear(&self) {
-        let mut inner = self.inner.write().expect("dataframe lock poisoned");
-        let count = inner.columns.len();
-        let scratch = std::mem::take(&mut inner.scratch);
-        *inner = Inner { columns: (0..count).map(|_| ColumnData::default()).collect(), scratch, ..Inner::default() };
     }
 
     fn check(&self, inner: &Inner, row: u64, column: usize) -> Result<&Column> {

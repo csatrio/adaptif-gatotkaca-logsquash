@@ -141,35 +141,49 @@ pub(crate) trait RowSource {
 /// Lock order: the caller takes the buffer lock (`DataFrame::with_inner`) **before** the word store, as `push_row` does
 /// (buffer, then words). A source that locked the buffer per cell while the caller held the words would invert that
 /// order and deadlock against a concurrent `push_row` (and read-lock the buffer recursively).
-pub(crate) struct BufferSource<'a>(pub(crate) &'a Inner);
+pub(crate) struct BufferSource<'a> {
+    inner: &'a Inner,
+    /// Rows visible through this source (a snapshot: rows pushed later are not seen).
+    rows: u64,
+}
 
-impl BufferSource<'_> {
+impl<'a> BufferSource<'a> {
+    /// All rows of the buffer.
+    pub(crate) fn all(inner: &'a Inner) -> Self {
+        Self { inner, rows: inner.rows }
+    }
+
+    /// The first `rows` rows of the buffer.
+    pub(crate) fn first(inner: &'a Inner, rows: u64) -> Self {
+        Self { inner, rows: rows.min(inner.rows) }
+    }
+
     fn column(&self, column: usize) -> Result<&crate::dataframe::ColumnData> {
-        self.0.columns.get(column).ok_or(Error::ColumnOutOfRange)
+        self.inner.columns.get(column).ok_or(Error::ColumnOutOfRange)
     }
 }
 
 impl RowSource for BufferSource<'_> {
     fn row_count(&self) -> u64 {
-        self.0.rows
+        self.rows
     }
 
     fn cell(&self, row: u64, column: usize) -> Result<(u64, bool)> {
         let data = self.column(column)?;
-        if row >= self.0.rows {
+        if row >= self.rows {
             return Err(Error::RowOutOfRange);
         }
         Ok((data.cells[row as usize], data.nulls.get(row as usize)))
     }
 
     fn with_entry(&self, cell: u64, f: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
-        let tail = self.0.row_heap.get((cell - 1) as usize..).ok_or(Error::Corrupt("row heap offset"))?;
+        let tail = self.inner.row_heap.get((cell - 1) as usize..).ok_or(Error::Corrupt("row heap offset"))?;
         f(tail)
     }
 
     fn range(&self, column: usize, lo: u64, hi: u64) -> Result<Vec<u32>> {
         let data = self.column(column)?;
-        Ok((0..self.0.rows as usize).filter(|&r| !data.nulls.get(r) && (lo..=hi).contains(&data.cells[r])).map(|r| r as u32).collect())
+        Ok((0..self.rows as usize).filter(|&r| !data.nulls.get(r) && (lo..=hi).contains(&data.cells[r])).map(|r| r as u32).collect())
     }
 }
 
